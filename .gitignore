@@ -1,0 +1,29 @@
+# Prerequisites
+*.d
+
+# Build output
+build/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.elf
+*.img
+*.iso
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Directories
+docs/
+
+# Binaries / Core dumps
+*.bin
+/core
+
+# Experimental files
+exp_*
