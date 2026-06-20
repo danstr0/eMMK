@@ -59,7 +59,7 @@ TEST_SRC := test/test_main.c test/test_types.c test/test_string.c \
 			test/test_slab.c test/test_interrupts.c               \
 			test/test_pci_net.c                                   \
 			test/test_netbuf.c test/test_net.c					  \
-			test/test_smp.c
+			test/test_smp.c test/test_spinlock.c
 
 # ── Object files ────────────────────────────────────────────────────────
 

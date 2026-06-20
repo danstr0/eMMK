@@ -51,10 +51,13 @@ extern uint32_t test_net(void);
 // v0.1.1 suite
 extern uint32_t test_smp(void);
 
+// v0.1.2 suite
+extern uint32_t test_spinlock(void);
+
 /**
  * @brief Run all test suites and exit QEMU.
  *
- * Does not return — terminates QEMU via the isa-debug-exit device.
+ * Does not return — terminates QEMU via the @c isa-debug-exit device.
  *
  * @param mb_info  Multiboot2 info pointer.
  */
@@ -64,11 +67,14 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
 
     uint32_t failures = 0;
 
-    // ── v0.0.1 (no MM dependencies) ─────────────────────
+    // ── v0.0.1 ──────────────────────────────────────────
     failures += test_types();
     failures += test_string();
 
-    // ── Initialize memory subsystem for v0.0.2+ ─────────
+    // ── v0.1.2 spinlock primitives ──────────────────────
+    failures += test_spinlock();
+
+    // ── Initialize memory subsystem ─────────────────────
     struct multiboot2_tag_mmap *mmap =
         (struct multiboot2_tag_mmap *)
         multiboot2_get_tag(mb_info, MULTIBOOT2_TAG_TYPE_MMAP);
