@@ -17,6 +17,9 @@
 #include "pic.h"
 #include "apic.h"
 #include "timer.h"
+#include "tss.h"
+#include "percpu.h"
+#include "smp.h"
 #include "pci.h"
 #include "virtio_net.h"
 #include "netbuf.h"
@@ -44,6 +47,9 @@ extern uint32_t test_pci_net(void);
 // v0.0.5 suites
 extern uint32_t test_netbuf(void);
 extern uint32_t test_net(void);
+
+// v0.1.1 suite
+extern uint32_t test_smp(void);
 
 /**
  * @brief Run all test suites and exit QEMU.
@@ -98,6 +104,16 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
 
     // ── v0.0.3 ──────────────────────────────────────────
     failures += test_interrupts();
+
+    // ── Initialize TSS, per-CPU, and SMP ────────────────
+    tss_init();
+    percpu_init_bsp();
+    idt_configure_ist();
+    smp_init();
+    kprintf("\n");
+
+    // ── v0.1.1 ──────────────────────────────────────────
+    failures += test_smp();
 
     // ── Initialize PCI ──────────────────────────────────
     pci_init();

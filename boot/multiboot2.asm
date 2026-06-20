@@ -128,7 +128,7 @@ _start:
     call enable_sse
 
     ;; 6. Load the 64-bit GDT and far-jump into long mode.
-    lgdt [gdt64.pointer]
+    lgdt [gdt64_pointer]
     jmp gdt64.code_segment:long_mode_start
 
 ;;; @}
@@ -369,13 +369,16 @@ hang:
 section .rodata32
 align 16
 
+global gdt64
+global gdt64_pointer
+
 gdt64:
     dq 0                                              ; null descriptor
 .code_segment: equ $ - gdt64
     dq (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53)  ; 64-bit code
 .data_segment: equ $ - gdt64
     dq (1 << 41) | (1 << 44) | (1 << 47)              ; 64-bit data
-.pointer:
+gdt64_pointer:
     dw $ - gdt64 - 1                                  ; limit (size - 1)
     dq gdt64                                          ; base address
 

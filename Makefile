@@ -2,8 +2,8 @@
 #
 # Targets:
 #   make         Build the kernel ISO
-#   make run     Build and boot in QEMU with virtio-net
-#   make test    Build and run the test kernel
+#   make run     Build and boot in QEMU with virtio-net (4 cores)
+#   make test    Build and run the test kernel (2 cores)
 #   make clean   Remove all build artifacts
 #
 # Prerequisites:
@@ -43,10 +43,12 @@ QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
 # ── Source files ────────────────────────────────────────────────────────
 
-ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm
+ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
+			boot/ap_trampoline.asm
 
 KERN_SRC := kernel/serial.c kernel/string.c kernel/idt.c            \
 			kernel/pic.c kernel/apic.c kernel/timer.c               \
+			kernel/tss.c kernel/percpu.c kernel/smp.c				\
 			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                   \
 			drivers/pci.c drivers/virtio.c drivers/net/virtio_net.c \
 			net/netbuf.c net/ethernet.c net/netdev.c                \
@@ -56,7 +58,8 @@ TEST_SRC := test/test_main.c test/test_types.c test/test_string.c \
 			test/test_pmm.c test/test_vmm.c test/test_heap.c      \
 			test/test_slab.c test/test_interrupts.c               \
 			test/test_pci_net.c                                   \
-			test/test_netbuf.c test/test_net.c
+			test/test_netbuf.c test/test_net.c					  \
+			test/test_smp.c
 
 # ── Object files ────────────────────────────────────────────────────────
 
@@ -71,14 +74,14 @@ TEST_OBJ := $(patsubst %.c,   build/%.o, $(TEST_SRC))
 all: build/os.iso
 
 run: build/os.iso
-	$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET)
+	$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) -smp 4
 
 ## Run the test kernel in QEMU
 ## success -> exit 1, failure -> exit 3
 test: build/test.iso
-	@$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) $(QEMU_TEST) 2>/dev/null; \
-	rc=$$?;                                                               \
-	if [ $$rc -eq 1 ]; then exit 0;                                       \
+	@$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) $(QEMU_TEST) -smp 2 2>/dev/null; \
+	rc=$$?;                                                                      \
+	if [ $$rc -eq 1 ]; then exit 0;                                              \
 	else echo "\nTEST RUN FAILED (qemu exit $$rc)"; exit 1; fi
 
 clean:
@@ -159,5 +162,6 @@ build/test/%.o: test/%.c
 
 -include $(wildcard build/kernel/*.d) $(wildcard build/mm/*.d)           \
          $(wildcard build/drivers/*.d) $(wildcard build/drivers/net/*.d) \
-         $(wildcard build/net/*.d) $(wildcard build/test/*.d)
+         $(wildcard build/net/*.d) $(wildcard build/test/*.d)            \
+		 $(wildcard build/boot/*.d)
 

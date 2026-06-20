@@ -198,6 +198,14 @@ void idt_set_handler(uint8_t vector, interrupt_handler_t handler);
  */
 void idt_set_gate(uint8_t vector, uint64_t handler, uint16_t selector,
                   uint8_t type_attr, uint8_t ist);
+
+/**
+ * @brief Configure IST entries for critical exceptions.
+ *
+ * Assigns IST1 to double-fault (#DF) and IST2 to NMI. Must be
+ * called after @c tss_init() has allocated IST stacks.
+ */
+void idt_configure_ist(void);
 /// @}
 
 /// @name Debug
