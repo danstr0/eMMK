@@ -22,11 +22,12 @@
 #include "serial.h"
 #include "string.h"
 #include "apic.h"
+#include "tss.h"
 
 // ── Static data ────────────────────────────────────────────────────────────
 
 /// The 256-entry IDT, 16-byte aligned.
-static struct idt_entry idt[IDT_ENTRIES] ALIGNED(16);
+struct idt_entry idt[IDT_ENTRIES] ALIGNED(16);
 
 /// LIDT descriptor.
 static struct idt_ptr idtr;
@@ -230,5 +231,19 @@ void idt_init(void)
 
     kprintf("[IDT] Loaded: %u entries at %p\n",
             IDT_ENTRIES, (void *)&idt);
+}
+
+void idt_configure_ist(void)
+{
+    // #DF (vector 8): use IST1
+    idt_set_gate(EXCEPTION_DF, isr_stub_table[EXCEPTION_DF],
+                 0x08, IDT_GATE_INTERRUPT, IST_DOUBLE_FAULT);
+
+    // NMI (vector 2): use IST2
+    idt_set_gate(EXCEPTION_NMI, isr_stub_table[EXCEPTION_NMI],
+                 0x08, IDT_GATE_INTERRUPT, IST_NMI);
+
+    kprintf("[IDT] IST configured: #DF=IST%d, NMI=IST%d\n",
+            IST_DOUBLE_FAULT, IST_NMI);
 }
 
