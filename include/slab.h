@@ -150,6 +150,9 @@ void *slab_alloc(struct slab_cache *cache);
 void slab_free(struct slab_cache *cache, void *obj);
 /// @}
 
+/// Flush magazines back to the shared cache.
+void slab_cache_drain_magazines(struct slab_cache *cache);
+
 /// @name Memory reclamation
 /// @{
 
