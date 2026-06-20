@@ -16,12 +16,17 @@
  * Allocation uses a rotor (@c pmm_last_alloc) to avoid always scanning
  * from the beginning, providing roughly O(n/64) amortised allocation in 
  * the common case.
+ *
+ * The critical sections of @c pmm_alloc_page(), @c pmm_alloc_pages(),
+ * @c pmm_alloc_aligned(), and @c pmm_free_pages() are wrapped with a
+ * spinlock @c pmm_lock.
  */
 
 #include "pmm.h"
 #include "multiboot2.h"
 #include "serial.h"
 #include "string.h"
+#include "spinlock.h"
 
 // ── Linker symbols & configuration ─────────────────────────────────────
 
@@ -65,6 +70,16 @@ static uint64_t pmm_free_count;
 
 /// PFN of the last successful allocation (rotor for fast scanning).
 static uint64_t pmm_last_alloc;
+
+/**
+ * Protects all bitmap state (bitmap, free_count, last_alloc).
+ *
+ * For now contention is low — the PMM is called primarily during
+ * init, heap expansion, and large-buffer allocation. The hot-path
+ * allocations go through the slab layer, which is per-core and
+ * lock-free.
+ */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 // ── Bitmap helpers ─────────────────────────────────────────────────────
 
@@ -153,7 +168,7 @@ void pmm_init(struct multiboot2_tag_mmap *mmap, uint64_t mb_info_end)
 
     // 6. Re-reserve vital regions that overlap "available" memory:
     //      - Low 1 MiB: real-mode IVT, BDA, EBDA, BIOS ROM
-    //      - Kernel image + bitmap: must not be allocated over
+    //      - Kernel image, multiboot2 info, bitmap
     pmm_bitmap_phys = bitmap_start;
 
     pmm_mark_used(0, 0x100000);
@@ -173,6 +188,9 @@ void pmm_init(struct multiboot2_tag_mmap *mmap, uint64_t mb_info_end)
 
 uint64_t pmm_alloc_page(void)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+
     uint64_t num_words = BITMAP_NUM_WORDS;
     uint64_t start_word = WORD_INDEX(pmm_last_alloc);
 
@@ -194,10 +212,12 @@ uint64_t pmm_alloc_page(void)
             bitmap_set(pfn);
             pmm_free_count--;
             pmm_last_alloc = pfn;
+            spin_unlock_irqrestore(&pmm_lock, flags);
             return PFN_TO_ADDR(pfn);
         }
     }
 
+    spin_unlock_irqrestore(&pmm_lock, flags);
     kprintf("[PMM] WARNING: Out of memory!\n");
     return PMM_ALLOC_FAILED;
 }
@@ -210,6 +230,9 @@ uint64_t pmm_alloc_pages(size_t count)
         return PMM_ALLOC_FAILED;
     if (count == 1)
         return pmm_alloc_page();
+
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
 
     // Linear scan for a contiguous run of free frames
     // Starts from the rotor position and wraps around once
@@ -237,6 +260,7 @@ uint64_t pmm_alloc_pages(size_t count)
                     bitmap_set(run_start + j);
                 pmm_free_count -= count;
                 pmm_last_alloc = run_start + count - 1;
+                spin_unlock_irqrestore(&pmm_lock, flags);
                 return PFN_TO_ADDR(run_start);
             }
         }
@@ -244,6 +268,7 @@ uint64_t pmm_alloc_pages(size_t count)
             run_len = 0;
     }
 
+    spin_unlock_irqrestore(&pmm_lock, flags);
     kprintf("[PMM] WARNING: Failed to allocate %lu contiguous pages\n",
             (uint64_t)count);
     return PMM_ALLOC_FAILED;
@@ -258,6 +283,9 @@ uint64_t pmm_alloc_aligned(size_t count, size_t align_pages)
 
     if (align_pages & (align_pages - 1))
         return PMM_ALLOC_FAILED;
+
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
 
     // Step through PFNs at alignment boundaries
     for (uint64_t pfn = 0; pfn + count <= pmm_total_pages; pfn += align_pages)
@@ -276,13 +304,14 @@ uint64_t pmm_alloc_aligned(size_t count, size_t align_pages)
                 bitmap_set(pfn + j);
             pmm_free_count -= count;
             pmm_last_alloc = pfn + count - 1;
+            spin_unlock_irqrestore(&pmm_lock, flags);
             return PFN_TO_ADDR(pfn);
         }
     }
 
+    spin_unlock_irqrestore(&pmm_lock, flags);
     kprintf("[PMM] WARNING: Failed to allocate %lu aligned pages"
             " (align=%lu)\n", (uint64_t)count, (uint64_t)align_pages);
-
     return PMM_ALLOC_FAILED;
 }
 
@@ -305,6 +334,9 @@ void pmm_free_page(uint64_t paddr)
 
 void pmm_free_pages(uint64_t paddr, size_t count)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+
     for (size_t i = 0; i < count; ++i)
     {
         uint64_t pfn = ADDR_TO_PFN(paddr + (i * PAGE_SIZE));
@@ -325,6 +357,8 @@ void pmm_free_pages(uint64_t paddr, size_t count)
         bitmap_clear(pfn);
         pmm_free_count++;
     }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 // ── Bitmap range manipulation ──────────────────────────────────────────
