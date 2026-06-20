@@ -61,6 +61,18 @@ SECTIONS
         *(.boot_stack)
     }
 
+    /* 
+     * AP trampoline - kept in the kernel image at its linked address
+     *
+     * smp_init() copies it to AP_TRAMPOLINE_ADDR(0x8000) at runtime 
+     */
+
+    .ap_trampoline ALIGN(4K) : AT(ADDR(.ap_trampoline))
+    {
+        _ap_trampoline_lma = .;
+        KEEP(*(.ap_trampoline))
+    }
+
     /* ───────────────────────────────────────────────────────────────────
      * Higher-half kernel sections
      *
