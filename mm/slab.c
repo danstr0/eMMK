@@ -32,6 +32,9 @@
 #include "heap.h"
 #include "serial.h"
 #include "string.h"
+#include "spinlock.h"
+#include "smp.h"
+#include "percpu.h"
 
 // ── Internal structures ────────────────────────────────────────────────
 
@@ -53,6 +56,24 @@ struct slab
     bool              was_full;    ///< Tracks which list this slab is on.
 };
 
+/// @name Per-core magazine
+/// @{
+
+/**
+ * Each core keeps a small local free list ("magazine") per cache.
+ * Alloc pops from the local list (no lock); free pushes onto it.
+ * When the magazine is empty, a batch is refilled from the shared
+ * cache (under the lock). When it overflows, a batch is returned.
+ */
+#define SLAB_MAGAZINE_SIZE  32
+
+struct slab_magazine
+{
+    void *objects[SLAB_MAGAZINE_SIZE];
+    int   count;                  ///< Number of objects in the magazine.
+};
+/// @}
+
 /// All metadata for a single object-size class.
 struct slab_cache
 {
@@ -73,6 +94,13 @@ struct slab_cache
     size_t active_objects;          ///< Currently allocated objects.
 
     struct slab_cache *next_cache;  ///< Global cache list linkage.
+
+    /// Protects slab lists, counters, and slab creation/destruction.
+    /// Not needed for per-core magazine access.
+    spinlock_t lock;
+
+    /// Per-core magazines (indexed by core number).
+    struct slab_magazine magazines[SMP_MAX_CORES];
 };
 
 // ── Global state ───────────────────────────────────────────────────────
@@ -82,6 +110,10 @@ static struct slab_cache *all_caches;
 
 /// Minimum object size (must hold a free-list pointer).
 #define MIN_OBJ_SIZE  sizeof(void *)
+
+// Forward declarations for locked helpers (used by destroy)
+static void *slab_alloc_locked(struct slab_cache *cache);
+static void  slab_free_locked(struct slab_cache *cache, void *obj);
 
 // ── Pre-defined size-class caches ──────────────────────────────────────
 
@@ -251,6 +283,11 @@ struct slab_cache *slab_cache_create(const char *name, size_t obj_size,
     cache->requested_size = obj_size;
     cache->obj_size       = obj_size;
     cache->flags          = flags;
+    cache->lock           = (spinlock_t)SPINLOCK_INIT;
+
+    // Zero all per-core magazines (kzalloc already zeroed, but be explicit)
+    for (int i = 0; i < SMP_MAX_CORES; ++i)
+        cache->magazines[i].count = 0;
 
     cache_calculate(cache);
 
@@ -268,6 +305,17 @@ void slab_cache_destroy(struct slab_cache *cache)
 {
     if (!cache)
         return;
+
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
+
+    // Drain all per-core magazines back to the shared cache
+    for (int c = 0; c < SMP_MAX_CORES; ++c)
+    {
+        struct slab_magazine *mag = &cache->magazines[c];
+        while (mag->count > 0)
+            slab_free_locked(cache, mag->objects[--mag->count]);
+    }
 
     if (cache->active_objects > 0)
         kprintf("[SLAB] WARNING: Destroying cache '%s' with %lu active objects\n",
@@ -291,6 +339,8 @@ void slab_cache_destroy(struct slab_cache *cache)
         slab_destroy(cache, s);
     }
 
+    spin_unlock_irqrestore(&cache->lock, flags);
+
     // Remove from the global cache list
     struct slab_cache **pp = &all_caches;
     while (*pp && *pp != cache)
@@ -303,14 +353,16 @@ void slab_cache_destroy(struct slab_cache *cache)
 
 // ── Public API - allocation ────────────────────────────────────────────
 
-void *slab_alloc(struct slab_cache *cache)
+/**
+ * @brief Allocate from the shared cache (caller must hold @c cache->lock).
+ *
+ * @return Object pointer, or @c NULL on failure.
+ */
+static void *slab_alloc_locked(struct slab_cache *cache)
 {
-    if (!cache)
-        return NULL;
-
     struct slab *slab = NULL;
 
-    // 1. Try a partial slab
+    // 1. Try a partial slab.
     if (cache->slabs_partial)
         slab = cache->slabs_partial;
     // 2. Promote an empty slab to partial
@@ -343,10 +395,6 @@ void *slab_alloc(struct slab_cache *cache)
     slab->in_use++;
     cache->active_objects++;
 
-    // Zero the object if the cache requests it
-    if (cache->flags & SLAB_ZERO)
-        memset(obj, 0, cache->obj_size);
-
     // If the slab is now full, move it to the full list
     if (slab->in_use == slab->total)
     {
@@ -358,20 +406,62 @@ void *slab_alloc(struct slab_cache *cache)
     return obj;
 }
 
+void *slab_alloc(struct slab_cache *cache)
+{
+    if (!cache)
+        return NULL;
+
+    // Fast path: pop from the local core's magazine (no lock)
+    int core = smp_core_id();
+    struct slab_magazine *mag = &cache->magazines[core];
+
+    if (mag->count > 0)
+    {
+        void *obj = mag->objects[--mag->count];
+        if (cache->flags & SLAB_ZERO)
+            memset(obj, 0, cache->obj_size);
+        return obj;
+    }
+
+    // Slow path: the magazine is empty - take the cache lock and
+    // refill the magazine with a batch of objects
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
+
+    int refill = SLAB_MAGAZINE_SIZE / 2;
+    if (refill < 1)
+        refill = 1;
+
+    for (int i = 0; i < refill; ++i)
+    {
+        void *obj = slab_alloc_locked(cache);
+        if (!obj)
+            break;
+        mag->objects[mag->count++] = obj;
+    }
+
+    spin_unlock_irqrestore(&cache->lock, flags);
+
+    // Pop one from the freshly refilled magazine
+    if (mag->count > 0)
+    {
+        void *obj = mag->objects[--mag->count];
+        if (cache->flags & SLAB_ZERO)
+            memset(obj, 0, cache->obj_size);
+        return obj;
+    }
+
+    return NULL;  // OOM
+}
+
 // ── Public API - deallocation ──────────────────────────────────────────
 
-void slab_free(struct slab_cache *cache, void *obj)
+/// Return an object to the shared cache (cache holds @c cache->lock).
+static void slab_free_locked(struct slab_cache *cache, void *obj)
 {
-    if (!cache || !obj)
-        return;
-
-    /*
-     * Locate the slab header by masking the object address down to the
-     * slab boundary
-     */
-    uintptr_t obj_addr = (uintptr_t)obj;
+    uintptr_t obj_addr  = (uintptr_t)obj;
     uintptr_t slab_base = obj_addr & ~(cache->slab_size - 1);
-    struct slab *slab = (struct slab *)slab_base;
+    struct slab *slab  = (struct slab *)slab_base;
 
     // Validate ownership
     if (slab->cache != cache)
@@ -408,12 +498,63 @@ void slab_free(struct slab_cache *cache, void *obj)
     // Was partial, still partial - nothing to do
 }
 
+void slab_free(struct slab_cache *cache, void *obj)
+{
+    if (!cache || !obj)
+        return;
+
+    // Fast path: push onto the local core's magazine (no lock)
+    int core = smp_core_id();
+    struct slab_magazine *mag = &cache->magazines[core];
+
+    if (mag->count < SLAB_MAGAZINE_SIZE)
+    {
+        mag->objects[mag->count++] = obj;
+        return;
+    }
+
+    // Slow path: magazine is full - drain half of it back to the shared
+    // cache under the lock, then push the object
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
+
+    int drain = SLAB_MAGAZINE_SIZE / 2;
+    for (int i = 0; i < drain; ++i)
+    {
+        void *drained = mag->objects[--mag->count];
+        slab_free_locked(cache, drained);
+    }
+
+    spin_unlock_irqrestore(&cache->lock, flags);
+
+    // Now there's room in the magazine
+    mag->objects[mag->count++] = obj;
+}
+
+// ── Public API - magazine flushing ─────────────────────────────────────
+
+void slab_cache_drain_magazines(struct slab_cache *cache)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
+    for (int c = 0; c < SMP_MAX_CORES; ++c)
+    {
+        struct slab_magazine *mag = &cache->magazines[c];
+        while (mag->count > 0)
+            slab_free_locked(cache, mag->objects[--mag->count]);
+    }
+    spin_unlock_irqrestore(&cache->lock, flags);
+}
+
 // ── Public API - reclamation ───────────────────────────────────────────
 
 size_t slab_cache_shrink(struct slab_cache *cache)
 {
     if (!cache)
         return 0;
+
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
 
     size_t freed = 0;
     struct slab *s, *next;
@@ -425,6 +566,8 @@ size_t slab_cache_shrink(struct slab_cache *cache)
         slab_list_remove(&cache->slabs_empty, s);
         slab_destroy(cache, s);
     }
+
+    spin_unlock_irqrestore(&cache->lock, flags);
 
     if (freed > 0)
         kprintf("[SLAB] Shrunk '%s': freed %lu pages\n",

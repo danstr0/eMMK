@@ -40,10 +40,12 @@ uint32_t test_slab(void)
         TEST_ASSERT_EQ(((uint8_t *)obj)[63], 0xCC, "slab write byte 63");
 
         struct slab_stats st;
+        slab_cache_drain_magazines(c);
         slab_cache_get_stats(c, &st);
         TEST_ASSERT_EQ(st.active_count, 1, "1 active after alloc");
 
         slab_free(c, obj);
+        slab_cache_drain_magazines(c);
         slab_cache_get_stats(c, &st);
         TEST_ASSERT_EQ(st.active_count, 0, "0 active after free");
 
@@ -119,6 +121,7 @@ uint32_t test_slab(void)
         for (size_t i = 1; i < per_slab; ++i)
             objs[i] = slab_alloc(c);
 
+        slab_cache_drain_magazines(c);
         slab_cache_get_stats(c, &st);
         TEST_ASSERT_EQ(st.active_count, per_slab,
                        "filled first slab");
@@ -147,6 +150,7 @@ uint32_t test_slab(void)
         slab_cache_get_stats(c, &st);
         TEST_ASSERT(st.slab_count > 0, "has slab before shrink");
 
+        slab_cache_drain_magazines(c);
         size_t freed = slab_cache_shrink(c);
         TEST_ASSERT(freed > 0, "shrink freed pages");
 

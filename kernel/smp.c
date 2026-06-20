@@ -61,6 +61,10 @@ int smp_core_id(void)
     if (gs_base != 0)
         return this_core_id();
 
+    // Before SMP init, only BSP is running
+    if (core_count == 0)
+        return 0;
+
     // Fallback: scan by APIC ID
     uint32_t id = lapic_id();
     for (int i = 0; i < core_count; ++i)
@@ -323,7 +327,7 @@ int smp_init(void)
             kprintf("[SMP] Failed to allocate stack for AP %d\n", i);
             continue;
         }
-    
+
         // Pre-register the core so ap_entry() can find itself
         cores[i].apic_id    = ap_apic_id;
         cores[i].online     = false;
