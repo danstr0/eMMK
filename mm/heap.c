@@ -25,6 +25,7 @@
 #include "vmm.h"
 #include "serial.h"
 #include "string.h"
+#include "spinlock.h"
 
 // ── Block header ───────────────────────────────────────────────────────
 
@@ -85,6 +86,15 @@ static uint64_t heap_num_frees;
 static uint64_t heap_vaddr;
 
 #define HEAP_VADDR_BASE  0xFFFFFFFFC0000000UL
+
+/**
+ * Protects all heap state (block lists, free list, counters, vaddr).
+ *
+ * Contention is moderate: the heap backs slab metadata and occasional large
+ * allocations. Hot-path object allocation goes through per-core slab caches,
+ * which are lock-free.
+ */
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 // ── Free list helpers ──────────────────────────────────────────────────
 
@@ -248,7 +258,7 @@ static void block_try_split(struct block_header *block, size_t size)
  *
  * Attempts to merge with the next block first, then the previous block.
  * Returns the resulting (possibly merged) block, which is @b not yet on the
- * free list - the caller must add it.
+ * free list — the caller must add it.
  */
 static struct block_header *block_coalesce(struct block_header *block)
 {
@@ -344,6 +354,9 @@ void *kmalloc(size_t size)
     if (size == 0)
         return NULL;
 
+    uint64_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
+
     size = ALIGN_UP_HEAP(size);
     if (size < HEAP_MIN_ALLOC)
         size = HEAP_MIN_ALLOC;
@@ -353,7 +366,10 @@ void *kmalloc(size_t size)
     while (block)
     {
         if (!block_validate(block, "kmalloc search"))
+        {
+            spin_unlock_irqrestore(&heap_lock, flags);
             return NULL;
+        }
         if (block->size >= size)
             break;
         block = block->next_free;
@@ -363,7 +379,10 @@ void *kmalloc(size_t size)
     if (!block)
     {
         if (!heap_expand(size))
+        {
+            spin_unlock_irqrestore(&heap_lock, flags);
             return NULL;
+        }
 
         block = free_list;
         while (block)
@@ -373,7 +392,10 @@ void *kmalloc(size_t size)
             block = block->next_free;
         }
         if (!block)
+        {
+            spin_unlock_irqrestore(&heap_lock, flags);
             return NULL;
+        }
     }
 
     // Remove from free list, split if worthwhile, mark allocated
@@ -384,6 +406,7 @@ void *kmalloc(size_t size)
     heap_used_size += block->size;
     heap_num_allocs++;
 
+    spin_unlock_irqrestore(&heap_lock, flags);
     return (void *)((uint8_t *)block + BLOCK_HEADER_SIZE);
 }
 
@@ -403,11 +426,9 @@ void *kaligned_alloc(size_t size, size_t alignment)
     if (alignment <= HEAP_ALIGNMENT)
         return kmalloc(size);
 
-    /*
-     * Over-allocate so there is room for the aligned_header and enough
-     * space to shift the user pointer forward to the next alignment
-     * boundary
-     */
+    // Over-allocate so there is room for the aligned_header and enough
+    // space to shift the user pointer forward to the next alignment
+    // boundary
     size_t overhead = alignment + sizeof(struct aligned_header);
     void *raw = kmalloc(size + overhead);
     if (!raw)
@@ -434,6 +455,9 @@ void kfree(void *ptr)
     if (!ptr)
         return;
 
+    uint64_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
+
     // Check whether this is an aligned allocation by looking for
     // ALIGNED_MAGIC
     struct aligned_header *ahdr =
@@ -443,18 +467,22 @@ void kfree(void *ptr)
     if (ahdr->magic == ALIGNED_MAGIC)
     {
         ahdr->magic = 0;      // prevent double-detection
-        ptr = ahdr->raw_ptr;
+        ptr = ahdr->raw_ptr;  // redirect to kmalloc ptr
     }
 
     struct block_header *block = (struct block_header *)
         ((uint8_t *)ptr - BLOCK_HEADER_SIZE);
 
     if (!block_validate(block, "kfree"))
+    {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return;
+    }
 
     if (block->is_free)
     {
         kprintf("[HEAP] WARNING: Double-free detected at %p\n", ptr);
+        spin_unlock_irqrestore(&heap_lock, flags);
         return;
     }
 
@@ -465,6 +493,8 @@ void kfree(void *ptr)
     // Coalesce with neighbors and return to the free list
     block = block_coalesce(block);
     free_list_add(block);
+
+    spin_unlock_irqrestore(&heap_lock, flags);
 }
 
 void *krealloc(void *ptr, size_t new_size)
@@ -478,11 +508,17 @@ void *krealloc(void *ptr, size_t new_size)
         return NULL;
     }
 
+    uint64_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
+
     struct block_header *block = (struct block_header *)
         ((uint8_t *)ptr - BLOCK_HEADER_SIZE);
 
     if (!block_validate(block, "krealloc"))
+    {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return NULL;
+    }
 
     new_size = ALIGN_UP_HEAP(new_size);
     if (new_size < HEAP_MIN_ALLOC)
@@ -490,7 +526,10 @@ void *krealloc(void *ptr, size_t new_size)
 
     // Current block is already large enough
     if (block->size >= new_size)
+    {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return ptr;
+    }
 
     // Try to absorb the next block if it is free and adjacent
     if (block->next && block->next->is_free)
@@ -515,16 +554,21 @@ void *krealloc(void *ptr, size_t new_size)
 
             heap_used_size += block->size - old_size;
 
+            spin_unlock_irqrestore(&heap_lock, flags);
             return ptr;
         }
     }
 
-    // Fall back to allocate-copy-free
+    // Fall back to allocate-copy-free. Release the lock
+    // before calling kmalloc/kfree since they take it.
+    size_t copy_size = block->size;
+    spin_unlock_irqrestore(&heap_lock, flags);
+
     void *new_ptr = kmalloc(new_size);
     if (!new_ptr)
         return NULL;
 
-    memcpy(new_ptr, ptr, block->size);
+    memcpy(new_ptr, ptr, copy_size);
     kfree(ptr);
 
     return new_ptr;
