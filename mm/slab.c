@@ -553,6 +553,9 @@ size_t slab_cache_shrink(struct slab_cache *cache)
     if (!cache)
         return 0;
 
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
+
     size_t freed = 0;
     struct slab *s, *next;
 
@@ -563,6 +566,8 @@ size_t slab_cache_shrink(struct slab_cache *cache)
         slab_list_remove(&cache->slabs_empty, s);
         slab_destroy(cache, s);
     }
+
+    spin_unlock_irqrestore(&cache->lock, flags);
 
     if (freed > 0)
         kprintf("[SLAB] Shrunk '%s': freed %lu pages\n",
