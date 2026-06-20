@@ -21,6 +21,9 @@
 #include "pic.h"
 #include "apic.h"
 #include "timer.h"
+#include "tss.h"
+#include "percpu.h"
+#include "smp.h"
 #include "pci.h"
 #include "virtio_net.h"
 #include "netbuf.h"
@@ -210,6 +213,14 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     lapic_init();
     ioapic_init(IOAPIC_BASE_PHYS_DEFAULT);
     timer_init();
+
+    // ── TSS, per-CPU, and SMP ───────────────────────────
+    kprintf("\n");
+    tss_init();
+    percpu_init_bsp();
+    idt_configure_ist();
+    kprintf("\n");
+    smp_init();
 
     // ── PCI and virtio-net ──────────────────────────────
     kprintf("\n");
