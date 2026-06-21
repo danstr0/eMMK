@@ -21,6 +21,7 @@
 #include "pic.h"
 #include "apic.h"
 #include "timer.h"
+#include "tsc.h"
 #include "tss.h"
 #include "percpu.h"
 #include "smp.h"
@@ -213,6 +214,7 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     lapic_init();
     ioapic_init(IOAPIC_BASE_PHYS_DEFAULT);
     timer_init();
+    tsc_init();
 
     // ── TSS, per-CPU, and SMP ───────────────────────────
     kprintf("\n");
@@ -280,6 +282,8 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
 
     kprintf("[SUMMARY] Timer: %u Hz, uptime %lu ms\n",
             TIMER_HZ, timer_get_ms());
+
+    kprintf("[SUMMARY] TSC: %lu MHz\n", tsc_get_freq() / 1000000);
 
     if (eth0)
         kprintf("[SUMMARY] Network: %s  MAC=%s IP=%s\n",
