@@ -48,7 +48,8 @@ ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
 
 KERN_SRC := kernel/serial.c kernel/string.c kernel/idt.c            \
 			kernel/pic.c kernel/apic.c kernel/timer.c               \
-			kernel/tss.c kernel/percpu.c kernel/smp.c				\
+			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c  \
+			kernel/log.c											\
 			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                   \
 			drivers/pci.c drivers/virtio.c drivers/net/virtio_net.c \
 			net/netbuf.c net/ethernet.c net/netdev.c                \
