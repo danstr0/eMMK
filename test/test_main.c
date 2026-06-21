@@ -17,6 +17,7 @@
 #include "pic.h"
 #include "apic.h"
 #include "timer.h"
+#include "tsc.h"
 #include "tss.h"
 #include "percpu.h"
 #include "smp.h"
@@ -106,6 +107,7 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
     lapic_init();
     ioapic_init(IOAPIC_BASE_PHYS_DEFAULT);
     timer_init();
+    tsc_init();
     kprintf("\n");
 
     // ── v0.0.3 ──────────────────────────────────────────

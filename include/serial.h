@@ -7,6 +7,11 @@
  * via the @c kprintf / @c kputs / @c kputchar convenience macros.
  *
  * @note Output-only (polled TX).
+ *
+ * @note @c serial_puts() and @c serial_printf() are internally synchronized
+ *       and disable local interrupts while transmitting. @c serial_putchar()
+ *       performs no synchronization and should only be used when external
+ *       serialization is already guaranteed.
  */
 
 #ifndef EMMK_SERIAL_H
@@ -131,11 +136,16 @@ void serial_init(uint16_t port, uint32_t baud);
  *
  * @param port  I/O base address.
  * @param c     Character to transmit.
+ *
+ * @note This function performs no synchronization.
  */
 void serial_putchar(uint16_t port, char c);
 
 /**
  * @brief Write a null-terminated string.
+ *
+ * Output is internally serialized and safe to call concurrently from
+ * multiple CPUs and interrupt contexts.
  *
  * @param port  I/O base address.
  * @param s     String to transmit.
@@ -146,6 +156,9 @@ void serial_puts(uint16_t port, const char *s);
  * @brief Write formatted output to a serial port.
  *
  * Supports a subset of standard printf format specifiers.
+ *
+ * Output is internally serialized and safe to call concurrently from
+ * multiple CPUs and interrupt contexts.
  *
  * @param port  I/O base address.
  * @param fmt   printf-style format string.
@@ -165,6 +178,7 @@ void serial_printf(uint16_t port, const char *fmt, ...);
 #define kputs(s)           serial_puts(COM1_PORT, s)
 
 /// Write a single character to the kernel console (COM1).
+/// @note Not internally synchronized.
 #define kputchar(c)        serial_putchar(COM1_PORT, c)
 /// @}
 

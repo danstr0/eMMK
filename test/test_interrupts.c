@@ -14,6 +14,7 @@
 #include "idt.h"
 #include "apic.h"
 #include "timer.h"
+#include "tsc.h"
 
 // ── INT3 handler test state ────────────────────────────────────────────
 
@@ -71,7 +72,7 @@ uint32_t test_interrupts(void)
     // ── timer_delay_us doesn't hang ─────────────────────
     {
         uint64_t before = timer_get_ticks();
-        timer_delay_us(500);
+        tsc_delay_us(500);
         uint64_t after = timer_get_ticks();
 
         // 500 us < 1 tick at 1000 Hz, so 0 or 1 ticks elapsed
