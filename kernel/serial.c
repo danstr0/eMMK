@@ -27,6 +27,9 @@
 
 #include "serial.h"
 #include "io.h"
+#include "spinlock.h"
+
+static spinlock_t serial_lock = SPINLOCK_INIT;
 
 // ── Initialization ─────────────────────────────────────────────────────
 
@@ -75,7 +78,8 @@ void serial_putchar(uint16_t port, char c)
     outb(port + UART_DATA, c);
 }
 
-void serial_puts(uint16_t port, const char *s)
+/// Lock-free version of @c serial_puts, for use by @c serial_printf.
+static void serial_puts_internal(uint16_t port, const char *s)
 {
     while (*s)
     {
@@ -83,6 +87,16 @@ void serial_puts(uint16_t port, const char *s)
             serial_putchar(port, '\r');
         serial_putchar(port, *s++);
     }
+}
+
+void serial_puts(uint16_t port, const char *s)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&serial_lock, &flags);
+
+    serial_puts_internal(port, s);
+
+    spin_unlock_irqrestore(&serial_lock, flags);
 }
 
 // ── printf internals ───────────────────────────────────────────────────
@@ -151,6 +165,9 @@ typedef enum
 
 void serial_printf(uint16_t port, const char *fmt, ...)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&serial_lock, &flags);
+
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
 
@@ -221,7 +238,7 @@ void serial_printf(uint16_t port, const char *fmt, ...)
             break;
         }
         case 'p':
-            serial_puts(port, "0x");
+            serial_puts_internal(port, "0x");
             serial_put_uint(port,
                             (uintptr_t)__builtin_va_arg(args, void *), 
                             16, false);
@@ -229,7 +246,7 @@ void serial_printf(uint16_t port, const char *fmt, ...)
         case 's':
         {
             const char *s = __builtin_va_arg(args, const char *);
-            serial_puts(port, s ? s : "(null)");
+            serial_puts_internal(port, s ? s : "(null)");
             break;
         }
         case 'c':
@@ -254,5 +271,7 @@ void serial_printf(uint16_t port, const char *fmt, ...)
     }
 
     __builtin_va_end(args);
+
+    spin_unlock_irqrestore(&serial_lock, flags);
 }
 
