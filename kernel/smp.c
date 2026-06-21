@@ -23,6 +23,7 @@
 #include "serial.h"
 #include "string.h"
 #include "timer.h"
+#include "tsc.h"
 
 // ── Trampoline symbols (from ap_trampoline.asm) ────────────────────────
 
@@ -178,7 +179,7 @@ static bool start_ap(uint32_t apic_id, uint64_t stack)
         lapic_write(LAPIC_ICR_LOW,
                     LAPIC_ICR_STARTUP | vector
                     | LAPIC_ICR_LEVEL_ASSERT);
-        timer_delay_us(200);
+        tsc_delay_us(200);
     }
 
     // Wait for the AP to signal ready (up to 100 ms)
@@ -270,10 +271,23 @@ NORETURN void ap_entry(void)
     ap_params->ap_ready = 1;
     barrier();
 
-    // Per-core idle loop. Later, each AP will run its own polling
-    // loop - for now halt and wait for IPIs.
-    for (;;)
+    // Wait for the BSP to assign a role and launch
+    while (!cores[my_core].launched)
         __asm__ volatile("sti;hlt");
+
+    if (cores[my_core].run_func)
+    {
+        kprintf("[SMP] Core %d entering role: %s\n",
+                my_core,
+                cores[my_core].role_name
+                    ? cores[my_core].role_name
+                    : "unnamed");
+        cores[my_core].run_func(my_core);
+    }
+
+    // No function assigned, or function returned
+    for (;;)
+        __asm__ volatile("sti; hlt");
 }
 
 // ── BSP initialization ─────────────────────────────────────────────────
@@ -347,5 +361,36 @@ int smp_init(void)
             aps_started, core_count);
 
     return aps_started;
+}
+
+// ── Per-core work assignment ───────────────────────────────────────────
+
+void smp_assign_role(int core_index, core_run_func_t func,
+                     const char *name)
+{
+    if (core_index < 0 || core_index >= core_count)
+        return;
+    cores[core_index].run_func  = func;
+    cores[core_index].role_name = name;
+    kprintf("[SMP] Core %d assigned role: %s\n", core_index, name);
+}
+
+void smp_launch_all(void)
+{
+    kprintf("[SMP] Launching all cores...\n");
+    barrier();
+    for (int i = 1; i < core_count; ++i)
+        if (cores[i].online)
+            cores[i].launched = true;
+    barrier();
+}
+
+const char *smp_get_role_name(int core_index)
+{
+    if (core_index < 0 || core_index >= core_count)
+        return "unknown";
+    return cores[core_index].role_name
+         ? cores[core_index].role_name
+         : "idle";
 }
 

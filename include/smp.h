@@ -71,6 +71,9 @@ struct ap_boot_params
 /// @name Core state
 /// @{
 
+/// Per-core work function (never returns).
+typedef void (*core_run_func_t)(int core_index);
+
 /// Per-core information (indexed by core number, @b not APIC ID).
 struct core_info
 {
@@ -78,6 +81,10 @@ struct core_info
     bool     online;      ///< True once the core has reached @c ap_entry().
     bool     is_bsp;      ///< True for core 0.
     void    *stack_base;  ///< Base of the per-core stack allocation.
+
+    core_run_func_t run_func;   ///< Assigned work function.
+    const char     *role_name;  ///< Human-readable role (for logging).
+    volatile bool   launched;   ///< Set by BSP to wake this core.
 };
 /// @}
 
@@ -125,6 +132,35 @@ struct core_info *smp_get_core(int index);
  * This function never returns.
  */
 NORETURN void ap_entry(void);
+/// @}
+
+/// @name Per-core work assignment
+/// @{
+
+/**
+ * @brief Assign a role to a core.
+ *
+ * The function is called when @c smp_launch_all() wakes the core,
+ * and must never return. The BSP's role function is not called
+ * automatically — the caller invokes it directly from @c kernel_main().
+ *
+ * @param core_index  Core to assign (0 = BSP, 1+ = APs).
+ * @param func        Work function (@c NULL = idle).
+ * @param name        Role name for logging (e.g., "distributor").
+ */
+void smp_assign_role(int core_index, core_run_func_t func,
+                     const char *name);
+
+/**
+ * @brief Wake all APs and have each call its assigned function.
+ *
+ * APs that have no function assigned remain in the idle loop.
+ * The BSP is not affected — call its role function directly.
+ */
+void smp_launch_all(void);
+
+/// @return The role name for a core, or "idle" if none assigned.
+const char *smp_get_role_name(int core_index);
 /// @}
 
 #endif // EMMK_SMP_H
