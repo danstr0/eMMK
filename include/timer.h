@@ -4,9 +4,9 @@
  *
  * Provides:
  * - System tick counter driven by the APIC timer.
- * - Monotonic time conversions (ticks → ms, seconds).
- * - Busy-wait delay functions (ms, µs).
- * - Deadline-based timeout helpers for driver polling loops.
+ * - Monotonic time conversions.
+ * - Tick-based sleep functions.
+ * - Deadline-based timeout helpers.
  *
  * The timer runs at @c TIMER_HZ ticks per second (default 1000 = 1 ms
  * resolution). Each tick increments a global counter via the APIC
@@ -122,14 +122,6 @@ void timer_sleep_ticks(uint64_t ticks);
  * @note Requires interrupts to be enabled.
  */
 void timer_sleep_ms(uint64_t ms);
-
-/**
- * @brief Busy-wait for @p us microseconds
- *
- * Uses a TSC-based spin loop — works even with interrupts disabled.
- * Precision depends on TSC calibration quality.
- */
-void timer_delay_us(uint64_t us);
 /// @}
 
 /// @name Deadline-based timeout helpers
