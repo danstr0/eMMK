@@ -3,6 +3,7 @@
 # Targets:
 #   make         Build the kernel ISO
 #   make run     Build and boot in QEMU with virtio-net (4 cores)
+#   make demo    Build and boot in QEMU with 4-core UDP echo server
 #   make test    Build and run the test kernel (2 cores)
 #   make clean   Remove all build artifacts
 #
@@ -38,7 +39,7 @@ LDFLAGS := -nostdlib               \
 # ── QEMU flags ──────────────────────────────────────────────────────────
 
 QEMU_BASE := -m 128M -serial stdio -display none
-QEMU_NET  := -device virtio-net-pci,netdev=net0 -netdev user,id=net0
+QEMU_NET  := -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=udp::8080-:7
 QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
 # ── Source files ────────────────────────────────────────────────────────
@@ -49,11 +50,11 @@ ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
 KERN_SRC := kernel/serial.c kernel/string.c kernel/idt.c            \
 			kernel/pic.c kernel/apic.c kernel/timer.c               \
 			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c  \
-			kernel/log.c											\
+			kernel/log.c kernel/spsc.c kernel/bench.c               \
 			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                   \
 			drivers/pci.c drivers/virtio.c drivers/net/virtio_net.c \
 			net/netbuf.c net/ethernet.c net/netdev.c                \
-			net/arp.c net/ip.c net/icmp.c
+			net/arp.c net/ip.c net/icmp.c net/udp.c net/dispatch.c
 
 TEST_SRC := test/test_main.c test/test_types.c test/test_string.c \
 			test/test_pmm.c test/test_vmm.c test/test_heap.c      \
@@ -77,13 +78,15 @@ all: build/os.iso
 run: build/os.iso
 	$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) -smp 4
 
-## Run the test kernel in QEMU
 ## success -> exit 1, failure -> exit 3
 test: build/test.iso
 	@$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) $(QEMU_TEST) -smp 2 2>/dev/null; \
 	rc=$$?;                                                                      \
 	if [ $$rc -eq 1 ]; then exit 0;                                              \
 	else echo "\nTEST RUN FAILED (qemu exit $$rc)"; exit 1; fi
+
+demo: build/demo.iso
+	$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) -smp 4
 
 clean:
 	rm -rf build
@@ -111,6 +114,18 @@ build/test.iso: build/test-kernel.bin grub.cfg
 	cp build/test-kernel.bin build/test-iso/boot/kernel.bin
 	cp grub.cfg build/test-iso/boot/grub/
 	$(GRUB) -o $@ build/test-iso 2>/dev/null
+
+# ── Demo kernel build ───────────────────────────────────────────────────
+
+build/demo-kernel.bin: $(ASM_OBJ) build/demo/main.o $(KERN_OBJ)
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS) -o $@ $^
+
+build/demo.iso: build/demo-kernel.bin grub.cfg
+	@mkdir -p build/demo-iso/boot/grub
+	cp build/demo-kernel.bin build/demo-iso/boot/kernel.bin
+	cp grub.cfg build/demo-iso/boot/grub/
+	$(GRUB) -o $@ build/demo-iso 2>/dev/null
 
 # ── Compilation rules ───────────────────────────────────────────────────
 
@@ -159,10 +174,15 @@ build/test/%.o: test/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DKERNEL_TEST -c $< -o $@
 
+## C - main.c recompiled with KERNEL_DEMO
+build/demo/main.o: kernel/main.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DKERNEL_DEMO -c $< -o $@
+
 # ── Auto-generated header dependencies ──────────────────────────────────
 
 -include $(wildcard build/kernel/*.d) $(wildcard build/mm/*.d)           \
          $(wildcard build/drivers/*.d) $(wildcard build/drivers/net/*.d) \
          $(wildcard build/net/*.d) $(wildcard build/test/*.d)            \
-		 $(wildcard build/boot/*.d)
+		 $(wildcard build/boot/*.d) $(wildcard build/demo/*.d)
 
