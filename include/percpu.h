@@ -51,12 +51,7 @@ struct percpu
     uint32_t       apic_id;     ///< Local APIC ID.
     struct tss    *tss;         ///< This core's TSS.
     uint64_t       rsp0;        ///< Kernel stack top (for RSP0 in TSS).
-
-    // Future per-core fields go here:
-    //   - per-core PMM bitmap / free list
-    //   - per-core slab caches
-    //   - per-core netdev RX queue
-    //   - per-core statistics / counters
+    // Future per-core fields
 };
 /// @}
 

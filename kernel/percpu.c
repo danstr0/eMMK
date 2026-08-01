@@ -15,7 +15,7 @@
 #include "serial.h"
 #include "string.h"
 
-// ── MSR helpers (same as apic.c - factor out later) ────────────────────
+// ── MSR helper ─────────────────────────────────────────────────────────
 
 static inline void wrmsr(uint32_t msr, uint64_t value)
 {

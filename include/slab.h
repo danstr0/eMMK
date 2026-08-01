@@ -1,35 +1,31 @@
 /**
  * @file slab.h
- * @brief Slab allocator interface.
+ * @brief Multi-core scalable slab allocator interface.
  *
- * Provides fast, fragmentation-free allocation of fixed-size objects.
- * Each "slab cache" manages objects of a single size. Objects are
- * allocated from "slabs" (one or more contiguous pages) and returned
- * to a per-slab free list on deallocation.
+ * Provides fast, fragmentation-free allocation of fixed-size objects
+ * using a two-tier hierarchy: CPU-local magazines for lockless fast-path
+ * allocations, and shared spinlock-protected slab lists for slow-path
+ * refills/drains.
  *
- * @par Design
- * - Named caches for specific kernel object types (e.g., network
- *   buffers, descriptors, page tables).
- * - Generic size-class caches (16..4096 bytes) created at init,
- *   used by @c slab_alloc_size() for callers that just need N bytes.
- * - Free objects store a next-pointer in-place (no per-object
- *   overhead while free).
- * - Slabs track their parent cache, enabling kfree-style freeing
- *   without requiring the caller to pass the size.
- *
- * @par Alignment
- * All slab objects are aligned to @c SLAB_MIN_ALIGN (16 bytes) or the
- * object size, whichever is smaller (but never less than
- * @c sizeof(void*)). Custom alignment can be specified at cache
- * creation time.
- *
- * @par Memory hierarchy (bottom to top)
- * @code
- *   PMM (pages) → Slab (fixed-size objects) → Caller
+ * @par Memory Hierarchy & Concurrency Model
+ * @code{.txt}
+ * [Callers] ───▶ Per-CPU Magazine (Lockless Fast Path)
+ *                      │
+ *                      │ (Refill / Drain under Cache Spinlock)
+ *                      ▼
+ *             Shared Cache Lists (Partial / Full / Empty)
+ *                      │
+ *                      ▼
+ *             PMM (Contiguous Physical Page Allocations)
  * @endcode
  *
- * Depends on the PMM for page allocation and the heap for cache
- * metadata. Must be initialized after @c heap_init().
+ * @par Alignment & Layout
+ * All slab objects are aligned to @c SLAB_MIN_ALIGN (16 bytes) or their
+ * effective size. Slabs are power-of-two sized so that object-to-slab
+ * header navigation can be performed in O(1) time using bitwise masking.
+ *
+ * Depends on the PMM for raw pages and the kernel heap for cache
+ * descriptors. Must be initialized after @c heap_init().
  */
 
 #ifndef EMMK_SLAB_H
@@ -37,7 +33,7 @@
 
 #include "types.h"
 
-/// @name Configuration
+/// @name Configuration constraints
 /// @{
 
 /// Minimum alignment for all slab-allocated objects.

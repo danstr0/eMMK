@@ -173,7 +173,6 @@ void icmp_send_dest_unreachable(struct netbuf *nb, uint8_t code);
 
 /// @name Statistics
 /// @{
-
 struct icmp_stats
 {
     uint64_t rx_echo_request;

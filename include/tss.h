@@ -20,6 +20,7 @@
  *   Slot 2:     64-bit data segment   (8 bytes)    selector 0x10
  *   Slot 3-4:   TSS for core 0        (16 bytes)   selector 0x18
  *   Slot 5-6:   TSS for core 1        (16 bytes)   selector 0x28
+ *   ...
  * @endcode
  *
  * @see Intel SDM Vol 3, §8.2 (Task Management Data Structures),
