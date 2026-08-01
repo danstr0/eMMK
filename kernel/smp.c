@@ -232,7 +232,7 @@ NORETURN void ap_entry(void)
     };
     __asm__ volatile("lidt %0" : : "m"(idtr));
 
-    // Enable this AP's Local APIC.
+    // Enable this AP's Local APIC
     lapic_write(LAPIC_SVR, APIC_SPURIOUS_VECTOR | LAPIC_SVR_ENABLE);
     lapic_write(LAPIC_TPR, 0);
 
@@ -381,7 +381,13 @@ void smp_launch_all(void)
     barrier();
     for (int i = 1; i < core_count; ++i)
         if (cores[i].online)
+        {
             cores[i].launched = true;
+
+            // Send a fixed vector IPI or direct interrupt to wake AP from HLT
+            lapic_write(LAPIC_ICR_HIGH, cores[i].apic_id << 24);
+            lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_LEVEL_ASSERT | APIC_SPURIOUS_VECTOR);
+        }
     barrier();
 }
 
