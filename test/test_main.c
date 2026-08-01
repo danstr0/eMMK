@@ -28,6 +28,7 @@
 #include "arp.h"
 #include "ip.h"
 #include "icmp.h"
+#include "udp.h"
 
 // v0.0.1 suites
 extern uint32_t test_types(void);
@@ -136,6 +137,7 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
     arp_init();
     ip_init();
     icmp_init();
+    udp_init();
     kprintf("\n");
 
     // ── v0.0.5 ──────────────────────────────────────────
