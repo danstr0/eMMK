@@ -8,6 +8,7 @@
 #include "ethernet.h"
 #include "arp.h"
 #include "icmp.h"
+#include "udp.h"
 #include "endian.h"
 #include "serial.h"
 #include "string.h"
@@ -202,9 +203,11 @@ void ip_input(struct netbuf *nb)
         case IPPROTO_ICMP:
             icmp_input(nb);
             break; 
-        // TCP and UDP are not yet implemented - drop
-        case IPPROTO_TCP:
         case IPPROTO_UDP:
+            udp_input(nb);
+            break;
+        // TCP not yet implemented - drop
+        case IPPROTO_TCP:
         default:
             netbuf_free(nb);
             break;
