@@ -2,12 +2,15 @@
  * @file main.c
  * @brief Kernel entry point (C side).
  *
- * Initializes all subsystems in dependency order, wires up the
- * virtio-net driver to the network stack, and enters the main
- * run-to-completion poll loop.
+ * Initializes all subsystems in dependency order, brings up all CPU
+ * cores, wires up the virtio-net driver to the network stack, and
+ * enters the main run-to-completion poll loop.
  *
- * When compiled with @c -DKERNEL_TEST the normal boot path is replaced
- * by the test runner (see test_main.c).
+ * @par Build modes
+ * - Default: single-core poll loop
+ * - @c KERNEL_TEST: test runner (see test/test_main.c)
+ * - @c KERNEL_DEMO: multi-core distributed pipeline with UDP echo
+ *   server and per-core benchmarking.
  */
 
 #include "types.h"
@@ -33,7 +36,14 @@
 #include "arp.h"
 #include "ip.h"
 #include "icmp.h"
+#include "udp.h"
 #include "string.h"
+
+#ifdef KERNEL_DEMO
+#include "dispatch.h"
+#include "bench.h"
+#include "log.h"
+#endif
 
 #ifdef KERNEL_TEST
 extern NORETURN void test_main(struct multiboot2_info *mb_info);
@@ -112,8 +122,7 @@ static const struct netdev_ops virtio_netdev_ops =
 };
 
 /**
- * @brief virtio-net RX callback — bridges received packets into the
- *        network stack.
+ * @brief virtio-net RX callback.
  *
  * Called inline by @c virtio_net_poll for each completed RX buffer.
  * Allocates a @c netbuf, copies the packet data, and queues it for
@@ -137,6 +146,82 @@ static void virtio_rx_callback(const void *data, size_t len, void *ctx)
 
     netdev_receive(dev, nb);
 }
+
+// ── Demo: UDP echo handler ─────────────────────────────────────────────
+
+#ifdef KERNEL_DEMO
+
+#define ECHO_PORT  7
+
+/// UDP echo handler — reflects datagrams back to the sender.
+static void udp_echo_handler(struct netbuf *nb)
+{
+    uint32_t src = nb->src_ip;
+    uint16_t sport = nb->src_port;
+    uint16_t dport = nb->dst_port;
+
+    // Send the echo reply, copying the payload
+    if (nb->len > 0 && nb->len <= 1400)
+        udp_send(src, sport, dport, nb->data, nb->len);
+
+    netbuf_free(nb);
+}
+
+///  Wraps @c dispatch_worker_loop with per-packet TSC measurement.
+static NORETURN void bench_worker_loop(int core_index)
+{
+    struct spsc_ring *ring = dispatch_get_core_ring(core_index);
+
+    if (!ring)
+    {
+        kprintf("[DEMO] Worker core %d has no ring\n", core_index);
+        for (;;) __asm__ volatile("sti; hlt");
+    }
+
+    kprintf("[DEMO] Worker running on core %d\n", core_index);
+
+    for (;;)
+    {
+        void *ptr;
+        while (spsc_ring_dequeue(ring, &ptr))
+        {
+            struct netbuf *nb = (struct netbuf *)ptr;
+            uint64_t t0 = tsc_read();
+            eth_input(nb);
+            uint64_t t1 = tsc_read();
+            bench_record(core_index, t1 - t0);
+        }
+        __asm__ volatile("pause");
+    }
+}
+
+/// Distributor loop with periodic benchmark reporting.
+static NORETURN void bench_distributor_loop(int core_index)
+{
+    (void)core_index;
+
+    kprintf("[DEMO] Distributor running on core %d\n", core_index);
+
+    uint64_t next_report = tsc_read() + tsc_get_freq() * 5;
+
+    for (;;)
+    {
+        netdev_poll_all();
+        dispatch_rx();
+
+        // Report every ~5 seconds
+        uint64_t now = tsc_read();
+        if (now >= next_report)
+        {
+            bench_report();
+            next_report = now + tsc_get_freq() * 5;
+        }
+
+        __asm__ volatile("pause");
+    }
+}
+
+#endif // KERNEL_DEMO
 
 // ── Entry point ────────────────────────────────────────────────────────
 
@@ -237,7 +322,8 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     arp_init();
     ip_init();
     icmp_init();
-
+    udp_init();
+ 
     // Wire virtio-net into the netdev abstraction
     struct netdev *eth0 = NULL;
     if (vnet)
@@ -293,7 +379,59 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
 
     kprintf("\nBoot complete.\n");
 
-    // ── Test ping to the gateway ───────────────────────────────────────
+    // ════════════════════════════════════════════════════
+    // DEMO: multi-core distributed pipeline with UDP echo
+    // ════════════════════════════════════════════════════
+#ifdef KERNEL_DEMO
+
+    int cores = smp_get_core_count();
+    int num_workers = cores - 1;
+
+    if (num_workers < 1)
+    {
+        kprintf("[DEMO] Need at least 2 cores (-smp 2). "
+                "Falling back to default\n");
+        goto non_demo;
+    }
+
+    // Initialize benchmarking
+    bench_init();
+
+    // Configure worker cores
+    int worker_ids[DISPATCH_MAX_WORKERS];
+    for (int i = 0; i < num_workers; ++i)
+        worker_ids[i] = i + 1;
+
+    dispatch_init(worker_ids, num_workers);
+
+    // Bind the UDP echo server
+    udp_bind(ECHO_PORT, udp_echo_handler);
+
+    kprintf("\n[DEMO] UDP echo server on port %d\n", ECHO_PORT);
+    kprintf("[DEMO] %d worker(s), distributor on core 0\n", num_workers);
+    kprintf("[DEMO] Reporting every 5 seconds\n");
+    kprintf("[DEMO] Test with: echo hello | nc -u 127.0.0.1 8080\n\n");
+
+    // Assign roles
+    smp_assign_role(0, bench_distributor_loop, "distributor");
+    for (int i = 0; i < num_workers; ++i)
+        smp_assign_role(worker_ids[i], bench_worker_loop, "worker");
+
+    // Wake APs into their worker loops
+    smp_launch_all();
+
+    // BSP becomes the distributor
+    bench_distributor_loop(0);
+
+non_demo:
+
+#endif // KERNEL_DEMO
+
+    // ══════════════════════════════
+    // Default: single-core poll loop
+    // ══════════════════════════════
+
+    // ── Test ping to the gateway ────────────────────────
     if (eth0)
     {
         kprintf("\n[PING] Sending echo request to gateway...\n");

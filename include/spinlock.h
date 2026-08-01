@@ -16,7 +16,7 @@
  *
  * The lock is held when @c next != @c owner. It is free when they
  * are equal. The 16-bit width allows 65535 concurrent waiters before
- * wrapping, which is more than sufficient for ≤ 16 cores.
+ * wrapping, which is more than enough for ≤ 16 cores.
  *
  * @par Interrupt safety
  * @c spin_lock_irqsave() disables interrupts before acquiring the
@@ -33,28 +33,28 @@
  * @par Performance notes
  * - The spin loop uses @c PAUSE to reduce pipeline pressure and
  *   improve power efficiency.
- * - On x86-64, @c lock xadd provides an atomic fetch-and-add in a 
- *   single instruction.
+ * - On x86-64, <code>lock xadd</code> provides an atomic fetch-and-add in
+ *   a single instruction.
  * - The compiler barrier in @c spin_unlock ensures all protected
  *   stores are visible before the lock is released.
  *
  * @par Usage
- * @code
+ * @code{.c}
  *   static spinlock_t my_lock = SPINLOCK_INIT;
  *
  *   spin_lock(&my_lock);
  *   // critical section
  *   spin_unlock(&my_lock);
  *
- *   // Or with interrupt safety:
+ *   // Or, with interrupt safety:
  *   uint64_t flags;
  *   spin_lock_irqsave(&my_lock, &flags);
- *   // critical section (interrupts disabled)
+ *   // critical section
  *   spin_unlock_irqrestore(&my_lock, flags);
  * @endcode
  *
  * @see Intel SDM Vol. 2, PAUSE instruction.
- * @see Intel SDM Vol. 3, §8.1 (locked atomic operations)
+ * @see Intel SDM Vol. 3, §9.1 (Locked Atomic Operations)
  */
 
 #ifndef EMMK_SPINLOCK_H

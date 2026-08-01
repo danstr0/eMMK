@@ -214,8 +214,12 @@ void arp_input(struct netbuf *nb)
 
     if (operation == ARP_OP_REQUEST)
     {
+        char sender_str[16];
+        char target_str[16];
+
         kprintf("[ARP] Request from %s for %s\n",
-                IP4_FMT(sender_ip), IP4_FMT(target_ip));
+                ip4_addr_to_str(sender_ip, sender_str),
+                ip4_addr_to_str(target_ip, target_str));
 
         arp_send_reply(dev, sender_ip, arp->sender_mac);
 

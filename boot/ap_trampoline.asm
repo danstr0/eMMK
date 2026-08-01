@@ -7,10 +7,10 @@
 ;;; mode, then jumps to the C entry point @c ap_entry().
 ;;;
 ;;; The BSP writes boot parameters (PML4, GDT, entry point, stack) into a
-;;; parameter block at offset @c AP_PARAMS_OFFSET (0xF00) within the same
+;;; parameter block at offset @c AP_PARAMS_OFFSET (@c 0xF00) within the same
 ;;; page. The trampoline reads these at runtime so nothing is hardcoded.
 ;;;
-;;; @par Memory layout of the trampoline page (4 KiB at 0x8000)
+;;; @par Memory layout of the trampoline page (4 KiB at @c 0x8000)
 ;;; @code
 ;;;   0x8000   Trampoline code (real → protected → long mode)
 ;;;   0x8F00   Parameter block (struct ap_boot_params)

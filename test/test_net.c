@@ -5,10 +5,14 @@
  */
 
 #include "test.h"
+#include "udp.h"
 #include "ip.h"
 #include "ethernet.h"
 #include "netdev.h"
 #include "endian.h"
+
+// Dummy handler for UDP bind tests
+static void udp_test_handler(struct netbuf *nb) { netbuf_free(nb); }
 
 uint32_t test_net(void)
 {
@@ -143,6 +147,27 @@ uint32_t test_net(void)
 
         TEST_ASSERT(ip_is_local(IP4_ADDR(127, 0, 0, 1)),
                     "127.0.0.1 is local");
+    }
+
+    // ── UDP bind / unbind ───────────────────────────────
+    {
+        TEST_ASSERT_EQ(udp_bind(9999, udp_test_handler), 0,
+                       "udp_bind succeeds");
+        TEST_ASSERT_EQ(udp_bind(9999, udp_test_handler), -1,
+                       "udp_bind rejects duplicate");
+        TEST_ASSERT_EQ(udp_bind(9998, udp_test_handler), 0,
+                       "udp_bind second port");
+
+        udp_unbind(9999);
+        TEST_ASSERT_EQ(udp_bind(9999, udp_test_handler), 0,
+                       "udp_bind after unbind");
+
+        TEST_ASSERT_EQ(udp_bind(0, NULL), -1,
+                       "udp_bind rejects NULL handler");
+
+        // Clean up
+        udp_unbind(9999);
+        udp_unbind(9998);
     }
 
     TEST_END();
