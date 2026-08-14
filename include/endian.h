@@ -8,8 +8,8 @@
  * @par Naming conventions
  * - @c htons / @c htonl — host to network (standard POSIX names).
  * - @c ntohs / @c ntohl — network to host.
- * - @c cpu_to_be*       — CPU (little) to big-endian (same as hton*).
- * - @c be*_to_cpu       — big-endian to CPU (same as ntoh*).
+ * - @c cpu_to_be*       — CPU (little) to big-endian (same as @c hton*).
+ * - @c be*_to_cpu       — big-endian to CPU (same as @c ntoh*).
  * - @c cpu_to_le*       — CPU to little-endian (identity on x86).
  * - @c le*_to_cpu       — little-endian to CPU (identity on x86).
  *

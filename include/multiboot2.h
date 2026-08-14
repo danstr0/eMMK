@@ -12,7 +12,7 @@
  * type is @c MULTIBOOT2_TAG_TYPE_END.
  *
  * @par Usage
- * @code
+ * @code{.c}
  *   struct multiboot2_tag_mmap *mmap;
  *   mmap = (struct multiboot2_tag_mmap *)
  *          multiboot2_get_tag(info, MULTIBOOT2_TAG_TYPE_MMAP);
@@ -193,6 +193,8 @@ struct multiboot2_tag_elf_sections
     // Section header entries follow
 } PACKED;
 
+///@}
+
 /// @name Tag lookup
 /// @{
 
@@ -253,7 +255,7 @@ multiboot2_get_tag(struct multiboot2_info *info, uint32_t type)
  * @param entry  Loop variable (type: @c struct @c multiboot2_mmap_entry *).
  *
  * Example:
- * @code
+ * @code{.c}
  *   struct multiboot2_mmap_entry *entry;
  *   multiboot2_mmap_foreach(mmap, entry)
  *   {
@@ -268,6 +270,7 @@ multiboot2_get_tag(struct multiboot2_info *info, uint32_t type)
          (uint8_t *)(entry) < (uint8_t *)(mmap) + (mmap)->size;              \
          (entry) = (struct multiboot2_mmap_entry *)                          \
                   ((uint8_t *)(entry) + (mmap)->entry_size))
+/// @}
 
 #endif // EMMK_MULTIBOOT2_H
 

@@ -72,7 +72,7 @@ STATIC_ASSERT(sizeof(struct tss) == 104, "TSS must be 104 bytes");
 /// @name IST indices
 /// @{
 
-/// IST entry used for double-fault (#DF) handling.
+/// IST entry used for double-fault (\#DF) handling.
 #define IST_DOUBLE_FAULT  1
 
 /// IST entry used for NMI handling.

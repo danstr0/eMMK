@@ -2,18 +2,13 @@
  * @file heap.h
  * @brief General-purpose kernel heap allocator.
  *
- * Provides @c kmalloc / <code>kfree</code>-style dynamic memory allocation for 
- * kernel use. Internally uses a linked-list free list with first-fit 
+ * Provides @c kmalloc / <code>kfree</code>-style dynamic memory allocation
+ * for kernel use. Internally uses a linked-list free list with first-fit 
  * allocation and block coalescing on free.
  *
  * @par Alignment guarantee
  * All allocations are aligned to at least @c HEAP_ALIGNMENT bytes (16),
  * satisfying x86-64 ABI requirements and SSE operand alignment.
- *
- * @par Thread safety
- * Not thread-safe. The heap currently assumes single-threaded access.
- * If concurrency is added later, callers must serialize access or the
- * allocator must be extended with locking.
  *
  * @par Backing memory
  * The heap obtains physical pages from the PMM and maps them via the VMM.

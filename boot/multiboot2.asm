@@ -1,3 +1,4 @@
+;;;
 ;;; @file multiboot2.asm
 ;;; @brief Multiboot2 header and 32-bit entry point for x86-64 kernel bootstrap.
 ;;;
@@ -14,7 +15,7 @@
 ;;;    transition.
 ;;;
 ;;; @par Virtual memory layout (after paging is enabled)
-;;; @code
+;;; @code{.txt}
 ;;;   0x0000_0000_0000_0000 .. 0x0000_0000_3FFF_FFFF  Identity    (1 GiB)
 ;;;   0xFFFF_FFFF_8000_0000 .. 0xFFFF_FFFF_BFFF_FFFF  Higher-half (1 GiB)
 ;;; @endcode
@@ -171,6 +172,7 @@ CPUID_LM_BIT   equ (1 << 29)
 ;;; (bit 29 of EDX).
 ;;;
 ;;; @return EAX = 1 if long mode is supported, 0 otherwise.
+;;;
 check_long_mode:
     ;; Verify that extended CPUID leaves are available
     mov eax, CPUID_EXT_BASE
@@ -209,17 +211,18 @@ PAGE_HUGE     equ (1 << 7)
 ;;; clear.
 ;;;
 ;;; Page table wiring:
-;;; @code
-;;;   PML4[0]    -> PDPT  (identity mapping)
+;;; @code{.txt}
+;;;  PML4[0]    -> PDPT  (identity mapping)
 ;;;   PML4[511]  -> PDPT  (higher-half: -2 GiB via PML4[511] + PDPT[510])
-;;;   PDPT[0]    -> PD    (identity, 1 GiB)
-;;;   PDPT[510]  -> PD    (higher-half, same physical 1 GiB)
-;;;   PD[0..511]          (512 x 2 MiB = 1 GiB)
-;;; @endcode
+;;;  PDPT[0]    -> PD    (identity, 1 GiB)
+;;;  PDPT[510]  -> PD    (higher-half, same physical 1 GiB)
+;;;  PD[0..511]          (512 x 2 MiB = 1 GiB)
+;;;@endcode
 ;;;
 ;;; Resulting virtual-to-physical translations:
 ;;; - @c 0x0000_0000_0000_0000 -> physical 0x0 (identity)
 ;;; - @c 0xFFFF_FFFF_8000_0000 -> physical 0x0 (higher-half / kernel)
+;;;
 setup_page_tables:
     ;; Zero all three page tables (3 * 4096 bytes)
     ;;   these are contiguous - pml4 | pdpt | pd
@@ -293,7 +296,7 @@ CR4_OSFXSR     equ (1 << 9)   ; OS supports FXSAVE/FXRSTOR
 CR4_OSXMMEXCPT equ (1 << 10)  ; OS supports unmasked SIMD FP exceptions
 
 ;;; @brief Enable SSE/SSE2 to prevent @c \#UD faults.
-;;;
+;;
 ;;; Some compilers emit SSE instructions even when @c -mno-sse is specified
 ;;; (e.g., for structure copies). Enabling SSE early avoids unexpected
 ;;; faults during kernel initialization.

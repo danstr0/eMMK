@@ -6,18 +6,18 @@
  * output with automatic CR/LF translation, and a minimal @c printf.
  *
  * @par Supported format specifiers
- * - @c \%d, @ \%i : signed decimal (@c int; @c int64_t with @c l / @c ll)
- * - @c \%u        : unsigned decimal (@c unsigned; @c uint64_t with @c l / @c ll)
- * - @c \%x        : unsigned hexadecimal, lowercase
- * - @c \%X        : unsigned hexadecimal, uppercase
- * - @c \%p        : pointer (printed as @c 0x..., lowercase hex)
- * - @c \%s        : null-terminated string (@c NULL prints "(null)")
- * - @c \%c        : single character
- * - @c \%\%       : literal percent sign
+ * - @c \%d, @c \%i : signed decimal (@c int; @c int64_t with @c l / @c ll)
+ * - @c \%u         : unsigned decimal (@c unsigned; @c uint64_t with @c l / @c ll)
+ * - @c \%x         : unsigned hexadecimal, lowercase
+ * - @c \%X         : unsigned hexadecimal, uppercase
+ * - @c \%p         : pointer (printed as @c 0x..., lowercase hex)
+ * - @c \%s         : null-terminated string (@c NULL prints "(null)")
+ * - @c \%c         : single character
+ * - @c \%\%        : literal percent sign
  *
  * @par Length modifiers
  * - (none) : @c int / @c unsigned (32-bit after default promotion)
- * - @cl    : @c long (64-bit on x86-64 LP64)
+ * - @c l   : @c long (64-bit on x86-64 LP64)
  * - @c ll  : <code>long long</code> (64-bit)
  *
  * @note @c serial_puts() and the literal-character path in @c serial_printf()

@@ -2,7 +2,7 @@
  * @file virtio.c
  * @brief Virtio transport layer — device init and virtqueue management.
  *
- * Implements the legacy (transitional) virtio PCI interface:
+ * Implements the legacy virtio PCI interface:
  * - Device initialization: reset, status handshake, feature negotiation.
  * - Virtqueue setup: allocate rings, build free list, write PFN.
  * - Descriptor management: alloc/free from a linked free list.

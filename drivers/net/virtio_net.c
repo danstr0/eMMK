@@ -2,7 +2,7 @@
  * @file virtio_net.c
  * @brief Virtio network device driver.
  *
- * @par Initialization sequence (legacy / transitional):
+ * @par Initialization sequence (legacy):
  * 1. Find the virtio-net PCI device.
  * 2. @c virtio_device_init() — reset, ACKNOWLEDGE, DRIVER.
  * 3. Negotiate features (MAC, STATUS).
@@ -51,7 +51,7 @@ static struct virtio_net_dev *g_virtio_net;
  * @param dev   Virtio-net device.
  * @param virt  Virtual address of the buffer.
  * @param phys  Physical address of the buffer.
- * @return 0 on success, -1 on failure.
+ * @return @c 0 on success, @c -1 on failure.
  */
 static int refill_rx_buf(struct virtio_net_dev *dev, void *virt, uint64_t phys)
 {

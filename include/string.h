@@ -86,7 +86,7 @@ size_t strlcpy(char *dest, const char *src, size_t size);
  * @param dest  Destination buffer (must already be null-terminated).
  * @param src   Source string to append.
  * @param size  Total size of @p dest.
- * @return <code>strlen(src) + min(size, strlen(dest))<\code>; if the
+ * @return <code>strlen(src) + min(size, strlen(dest))</code>; if the
  *         return value ≥ @p size, truncation occurred.
  */
 size_t strlcat(char *dest, const char *src, size_t size);
