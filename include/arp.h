@@ -8,12 +8,12 @@
  * 1. Check the ARP cache for an existing IP → MAC mapping.
  * 2. If found (@c RESOLVED): use the cached MAC address.
  * 3. If not found: broadcast an ARP request, queue the packet,
- *    and return "pending."
+ *    and return "pending".
  * 4. When the ARP reply arrives: cache the mapping, transmit
  *    all queued packets for that IP.
  *
  * @par ARP packet format (Ethernet + IPv4)
- * @code
+ * @code{.txt}
  *   ┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
  *   ┃ Offset ┃ Size    ┃ Field           ┃
  *   ┣━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━┫
@@ -79,7 +79,7 @@
 /// @{
 #define ARP_STATE_FREE      0  ///< Entry is unused.
 #define ARP_STATE_PENDING   1  ///< Request sent, awaiting reply.
-#define ARP_STATE_RESOLVED  2  ///< Have a valid MAC address.
+#define ARP_STATE_RESOLVED  2  ///< Has a valid MAC address.
 #define ARP_STATE_STATIC    3  ///< Manually configured (never expires).
 /// @}
 

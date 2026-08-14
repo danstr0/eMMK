@@ -2,7 +2,7 @@
 ;;; @brief Application Processor startup trampoline.
 ;;;
 ;;; This code is copied by the BSP to physical address @c AP_TRAMPOLINE_ADDR
-;;; (0x8000) before sending SIPI. Each AP begins execution here in 16-bit
+;;; (@c 0x8000) before sending SIPI. Each AP begins execution here in 16-bit
 ;;; real mode and transitions through protected mode into 64-bit long
 ;;; mode, then jumps to the C entry point @c ap_entry().
 ;;;
@@ -11,20 +11,21 @@
 ;;; page. The trampoline reads these at runtime so nothing is hardcoded.
 ;;;
 ;;; @par Memory layout of the trampoline page (4 KiB at @c 0x8000)
-;;; @code
+;;; @code{.txt}
 ;;;   0x8000   Trampoline code (real → protected → long mode)
 ;;;   0x8F00   Parameter block (struct ap_boot_params)
 ;;;   0x8FFF   End of page
 ;;; @endcode
 
-; The trampoline is assembled position-independently at address 0.
-; The BSP copies it to @c AP_TRAMPOLINE_ADDR, so all absolute references
-; must be relative to that base.
-
+;;; The trampoline is assembled position-independently at address 0.
+;;; The BSP copies it to @c AP_TRAMPOLINE_ADDR, so all absolute references
+;;; must be relative to that base.
+;;;
 %define TRAMPOLINE_BASE  0x8000
 %define PARAMS           (TRAMPOLINE_BASE + 0xF00)
 
-; Parameter block field offsets (must match struct ap_boot_params)
+;;; @name Parameter block field offsets
+;;; @{
 %define PARAM_PML4           0
 %define PARAM_GDT_PTR_LOW    4
 %define PARAM_GDT_PTR_HIGH   8
@@ -33,6 +34,7 @@
 %define PARAM_STACK_TOP     24
 %define PARAM_AP_READY      32
 %define PARAM_AP_ID         36
+;;; @}
 
 section .ap_trampoline
 global ap_trampoline_start

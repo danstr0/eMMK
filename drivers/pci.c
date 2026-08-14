@@ -19,7 +19,7 @@ static int device_count = 0;
 
 /**
  * Build the 32-bit address word for PCI config port @c 0xCF8.
- * The offset is masked to dword alignment.
+ * The offset is masked to @c dword alignment.
  */
 static inline uint32_t pci_address(uint8_t bus, uint8_t dev,
                                    uint8_t func, uint8_t offset)

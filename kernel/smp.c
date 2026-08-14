@@ -203,10 +203,10 @@ static bool start_ap(uint32_t apic_id, uint64_t stack)
 NORETURN void ap_entry(void)
 {
     // At this point:
-    //   - In 64-bit long mode with a fresh per-AP stack
-    //   - CR3 points to the BSP's page tables
-    //   - The BSP's runtime GDT is loaded (via the trampoline)
-    //   - No LAPIC enabled yet, no TSS, no per-CPU area
+    // - In 64-bit long mode with a fresh per-AP stack
+    // - CR3 points to the BSP's page tables
+    // - The BSP's runtime GDT is loaded (via the trampoline)
+    // - No LAPIC enabled yet, no TSS, no per-CPU area
 
     // Reload segment registers
     __asm__ volatile(

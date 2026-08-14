@@ -66,7 +66,6 @@ struct ap_boot_params
 /// Offset of the parameter block within the trampoline page.
 /// Placed at the end of the 4 KiB page to avoid colliding with code.
 #define AP_PARAMS_OFFSET  0xF00
-/// @}
 
 /// @name Core state
 /// @{

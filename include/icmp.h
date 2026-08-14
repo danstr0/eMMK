@@ -8,7 +8,7 @@
  * - Time Exceeded (not implemented — no forwarding).
  *
  * @par Header format (8 bytes)
- * @code
+ * @code{.txt}
  *   ┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
  *   ┃ Offset ┃ Size    ┃ Field              ┃
  *   ┣━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━┫
@@ -143,7 +143,7 @@ void icmp_send_echo_reply(struct netbuf *nb);
  * @param dst_ip  Destination IP (host byte order).
  * @param id      Echo identifier (host byte order).
  * @param seq     Echo sequence number (host byte order).
- * @param data    Optional payload data (may be @c NULL if @p len == 0).
+ * @param data    Optional payload data (may be @c NULL if @p len == @c 0).
  * @param len     Payload length in bytes.
  * @return @c 0 on success, @c -1 on error.
  */

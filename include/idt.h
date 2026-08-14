@@ -189,7 +189,7 @@ void idt_set_handler(uint8_t vector, interrupt_handler_t handler);
  *
  * @param vector     Interrupt vector (0-255).
  * @param handler    Handler entry point address.
- * @param selector   Code segment selector (e.g., 0x08 for kernel CS).
+ * @param selector   Code segment selector (e.g., @c 0x08 for kernel CS).
  * @param type_attr  Gate type and attributes (e.g., @c IDT_GATE_INTERRUPT).
  * @param ist        IST index (0 = no stack switch, 1-7 = IST entry).
  *
@@ -202,7 +202,7 @@ void idt_set_gate(uint8_t vector, uint64_t handler, uint16_t selector,
 /**
  * @brief Configure IST entries for critical exceptions.
  *
- * Assigns IST1 to double-fault (#DF) and IST2 to NMI. Must be
+ * Assigns IST1 to double-fault (\#DF) and IST2 to NMI. Must be
  * called after @c tss_init() has allocated IST stacks.
  */
 void idt_configure_ist(void);

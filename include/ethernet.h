@@ -3,7 +3,7 @@
  * @brief Ethernet (Layer 2) frame handling.
  *
  * Handles parsing and construction of Ethernet II frames:
- * @code
+ * @code{.txt}
  *   ┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
  *   ┃ Offset ┃ Size    ┃ Field           ┃
  *   ┣━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━┫
@@ -52,10 +52,10 @@
 /// @name Well-known MAC addresses
 /// @{
 
-/// Broadcast address: FF:FF:FF:FF:FF:FF.
+/// Broadcast address: @c FF:FF:FF:FF:FF:FF.
 extern const uint8_t ETH_BROADCAST[ETH_ALEN];
 
-/// Zero address: 00:00:00:00:00:00 (unset / invalid).
+/// Zero address: @c 00:00:00:00:00:00 (unset / invalid).
 extern const uint8_t ETH_ZERO[ETH_ALEN];
 /// @}
 
@@ -140,7 +140,7 @@ static inline bool eth_addr_equal(const uint8_t *a, const uint8_t *b)
         && (a[3] == b[3]) && (a[4] == b[4]) && (a[5] == b[5]);
 }
 
-/// Check if a MAC address is the broadcast address (FF:FF:FF:FF:FF:FF).
+/// Check if a MAC address is the broadcast address (@c FF:FF:FF:FF:FF:FF).
 static inline bool eth_is_broadcast(const uint8_t *addr)
 {
     return (addr[0] & addr[1] & addr[2]
@@ -186,7 +186,7 @@ static inline void eth_copy_addr(uint8_t *dest, const uint8_t *src)
  *          once in a single @c kprintf argument list — both expansions
  *          return the same pointer and the second call will overwrite
  *          the first. Use explicit buffers instead:
- * @code
+ * @code{.c}
  *   char s[18], d[18];
  *   kprintf("src=%s dst=%s\n",
  *           eth_addr_to_str(hdr->src, s),
@@ -199,7 +199,7 @@ char *eth_addr_to_str(const uint8_t *addr, char *buf);
  * @brief Convenience macro — uses the internal static buffer.
  * 
  * @warning Only safe for a @b single MAC in one @c kprintf call.
- * @code
+ * @code{.c}
  *   kprintf("src=%s\n", ETH_FMT(hdr->src));  // OK
  *
  *   kprintf("src=%s dest=%s\n", ETH_FMT(a), ETH_FMT(b));  // BAD

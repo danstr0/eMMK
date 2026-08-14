@@ -106,7 +106,7 @@
 #define LAPIC_LVT_LEVEL           (1 << 15)  ///< Level triggered (vs edge).
 #define LAPIC_LVT_PENDING         (1 << 12)  ///< Delivery status: pending.
 
-/// Delivery mode field (bits 10:8) in LVT entries.
+// Delivery mode field (bits 10:8) in LVT entries.
 #define LAPIC_LVT_DELMODE_FIXED   (0 << 8)
 #define LAPIC_LVT_DELMODE_SMI     (2 << 8)
 #define LAPIC_LVT_DELMODE_NMI     (4 << 8)
@@ -167,7 +167,7 @@
 /// APIC error interrupt vector.
 #define APIC_ERROR_VECTOR     49
 
-/// Spurious interrupt vector (traditionally 0xFF).
+/// Spurious interrupt vector (traditionally @c 0xFF).
 #define APIC_SPURIOUS_VECTOR  255
 /// @}
 

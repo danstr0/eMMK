@@ -7,7 +7,7 @@
 ;;; rather than looked up at runtime.
 ;;;
 ;;; @par Interrupt flow
-;;; @code
+;;; @code{.txt}
 ;;;   CPU pushes:  SS, RSP, RFLAGS, CS, RIP [, error code]
 ;;;   Stub pushes: [dummy error code], vector number, all GPRs
 ;;;   Stub calls:  interrupt_dispatch(frame *rdi)
@@ -55,7 +55,6 @@ isr_stub_%1:
 ;;; @brief Vectors 0-31. Exceptions that push and error code use
 ;;;        @c ISR_ERR; all others use @c ISR_NOERR.
 ;;; @{
-
 ISR_NOERR 0        ; #DE  Divide Error
 ISR_NOERR 1        ; #DB  Debug
 ISR_NOERR 2        ;      NMI
@@ -88,7 +87,6 @@ ISR_NOERR 28       ;      Reserved
 ISR_NOERR 29       ;      Reserved
 ISR_NOERR 30       ;      Reserved
 ISR_NOERR 31       ;      Reserved
-
 ;;; @}
 
 ; ── IRQ and remaining vector stubs (32-255) ─────────────────────────────
@@ -97,13 +95,11 @@ ISR_NOERR 31       ;      Reserved
 ;;; @brief Vectors 32-47: legacy PIC IRQs (remapped).
 ;;;        Vectors 48-255: available for APIC, MSI, software interrupts.
 ;;; @{
-
 %assign i 32
 %rep 224
     ISR_NOERR i
 %assign i i+1
 %endrep
-
 ;;; @}
 
 ;;; @defgroup isr_common Common Handler
@@ -112,17 +108,16 @@ ISR_NOERR 31       ;      Reserved
 ;;;        restores state, and returns via IRETQ.
 ;;;
 ;;; Stack on entry (low address at top):
-;;; @code
+;;; @code{.txt}
 ;;;   [RSP+0]   vector number  (pushed by stub)
 ;;;   [RSP+8]   error code     (pushed by CPU or stub)
 ;;;   [RSP+16]  RIP            (pushed by CPU)
 ;;;   [RSP+24]  CS             (pushed by CPU)
 ;;;   [RSP+32]  RFLAGS         (pushed by CPU)
-;;;   [RSP+40]  RSP            (pushed by CPU)
-;;;   [RSP+48]  SS             (pushed by CPU)
+;;;  [RSP+40]  RSP            (pushed by CPU)
+;;;  [RSP+48]  SS             (pushed by CPU)
 ;;; @endcode
 ;;; @{
-
 isr_common:
     ;; Save all general-purpose registers.
     push rax
@@ -177,7 +172,6 @@ isr_common:
 
     ;; Return from interrupt
     iretq
-
 ;;; @}
 
 ; ── ISR stub table ──────────────────────────────────────────────────────
@@ -186,7 +180,6 @@ isr_common:
 ;;; @brief Array of 256 function pointers, indexed by vector number.
 ;;;        Used by @c idt_init() to populate all IDT entries.
 ;;; @{
-
 section .data
 global isr_stub_table
 
@@ -196,7 +189,6 @@ isr_stub_table:
     dq isr_stub_ %+ i
 %assign i i+1
 %endrep
-
 ;;; @}
 
 section .note.GNU-stack noalloc noexec nowrite

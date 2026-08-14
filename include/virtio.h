@@ -21,9 +21,9 @@
  *   [descriptors][available ring + padding to 4096][used ring]
  * @endcode
  *
- * This implementation uses the legacy (transitional) virtio PCI
- * interface, where configuration is accessed via I/O ports. The
- * modern (MMIO-based) interface is not implemented.
+ * This implementation uses the legacy virtio PCI interface, where
+ * configuration is accessed via I/O ports. The modern (MMIO-based)
+ * interface is not yet implemented.
  *
  * @see Virtio Specification v1.3
  */

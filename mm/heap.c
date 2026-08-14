@@ -3,7 +3,7 @@
  * @brief Kernel heap allocator (first-fit, coalescing free list).
  *
  * @par Memory layout
- * @code
+ * @code{.txt}
  *   [block_header][user_data...][block_header][user_data...]...
  * @endcode
  *
