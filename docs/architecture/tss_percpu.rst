@@ -250,7 +250,7 @@ TSS Functions
    16-byte TSS descriptor into the shared ``runtime_gdt``, loads the
    runtime GDTR, and issues ``ltr``.
 
-.. c:function:: struct tss \*tss_get(int core_index)
+.. c:function:: struct tss *tss_get(int core_index)
 
    Returns a pointer to the ``tss`` structure for the specified core
    index, or ``NULL`` if out of bounds.
@@ -268,7 +268,7 @@ Per-CPU Functions & Accessors
    Allocates and installs an AP's ``struct percpu`` instance and sets its
    local ``MSR_GS_BASE``.
 
-.. c:function:: static inline struct percpu \*this_cpu(void)
+.. c:function:: static inline struct percpu *this_cpu(void)
 
    Retrieves the current core's ``struct percpu`` pointer via
    ``movq %gs:0``.

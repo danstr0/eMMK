@@ -117,7 +117,7 @@ and fragmentation issues.
 - ``heap_get_stats()``: Populates a ``heap_stats`` structure with current
   usage, lifetime allocation counts, and the number of free blocks.
 - ``heap_dump()``: Iterates through the entire free list and prints block
-  addresses and sizes to the `:ref:serial-console`. This is the primary
+  addresses and sizes to the serial console. This is the primary
   tool for diagnosing heap corruption.
 
 

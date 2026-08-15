@@ -37,8 +37,8 @@ for allocation.
 
 The PMM does **not** handle:
 
-- Virtual memory mappings (see :ref:vmm).
-- Object-level allocation (see :ref:slab-allocator).
+- Virtual memory mappings.
+- Object-level allocation.
 - Cache coherency or memory attributes.
 
 Concurrency Safety and Spinlocks

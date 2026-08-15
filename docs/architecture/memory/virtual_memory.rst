@@ -9,7 +9,7 @@ It is responsible for translating virtual addresses into physical addresses,
 enforcing memory protections (e.g., No-Execute), and managing the translation
 lookaside buffer (TLB).
 
-The VMM operates as a consumer of the :ref:physical-memory. While the PMM
+The VMM operates as a consumer of the physical memory. While the PMM
 manages the supply of raw pages, the VMM provides the logic to organize
 those pages into a coherent address space.
 

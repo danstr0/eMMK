@@ -122,12 +122,12 @@ API Reference
 Basic Locking
 -------------
 
-.. c:function:: static inline void spin_lock(spinlock_t \*lock)
+.. c:function:: static inline void spin_lock(spinlock_t *lock)
 
    Atomically claims a ticket using ``lock xaddw`` and spins until
    ``owner == ticket``. 
 
-.. c:function:: static inline void spin_unlock(spinlock_t \*lock)
+.. c:function:: static inline void spin_unlock(spinlock_t *lock)
 
    Enforces a compiler barrier and increments ``owner``, allowing the next
    waiter to proceed.
@@ -135,26 +135,26 @@ Basic Locking
 Interrupt-Safe Locking
 ----------------------
 
-.. c:function:: static inline void spin_lock_irqsave(spinlock_t \*lock, uint64_t \*flags)
+.. c:function:: static inline void spin_lock_irqsave(spinlock_t *lock, uint64_t *flags)
 
    Saves the local CPU's ``RFLAGS`` register to ``*flags``, executes
    ``cli`` to disable interrupts, and acquires the lock.
 
-.. c:function:: static inline void spin_unlock_irqrestore(spinlock_t \*lock, uint64_t flags)
+.. c:function:: static inline void spin_unlock_irqrestore(spinlock_t *lock, uint64_t flags)
 
    Releases the spinlock and restores the CPU's ``RFLAGS`` from ``flags``.
 
 Non-Blocking & Diagnostics
 --------------------------
 
-.. c:function:: static inline bool spin_trylock(spinlock_t \*lock)
+.. c:function:: static inline bool spin_trylock(spinlock_t *lock)
 
    Attempts a single non-blocking acquire using atomic compare-and-swap
    (``lock cmpxchgw``). Returns ``true`` if successfully acquired, or
    ``false`` if the lock was busy. Useful in non-blocking diagnostic paths
    such as emergency serial panic logs.
 
-.. c:function:: static inline bool spin_is_locked(spinlock_t \*lock)
+.. c:function:: static inline bool spin_is_locked(spinlock_t *lock)
 
    Returns ``true`` if ``owner != next`` (lock is currently held), without
    modifying any lock counters.

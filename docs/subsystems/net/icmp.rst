@@ -30,7 +30,7 @@ eMMK supports the full "Ping" cycle:
 1. **Echo Request (RX):** When an ``ICMP_ECHO_REQUEST`` is received via
    ``icmp_input()``, the kernel automatically generates a response.
 2. **Echo Reply (TX):** The ``icmp_send_echo_reply()`` function reuses
-   the incoming :ref:netbuf. It swaps the IP addresses, changes the ICMP
+   the incoming ``netbuf``. It swaps the IP addresses, changes the ICMP
    type to 0 (Reply), recomputes the checksum, and sends it back.
 3. **Client Support:** Applications can use ``icmp_send_echo_request()`` to
    send a ping to a remote host.
