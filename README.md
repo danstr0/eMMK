@@ -117,5 +117,5 @@ The echo server reflects the payload back unchanged, exercising the full network
 
 ## Documentation
 
-See the [docs/](docs/) directory.
+Visit [danstr0.github.io/eMMK/](https://danstr0.github.io/eMMK/)
 
