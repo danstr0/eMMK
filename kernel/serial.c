@@ -3,38 +3,36 @@
  * @brief UART serial port driver (8250/16550A compatible).
  *
  * Implements polled (blocking) serial output: raw character output, string
- * output with automatic CR/LF translation, and a minimal @c printf.
+ * output with automatic CR/LF translation, and formatted output via the
+ * shared formatter in format.c (see format.h for supported specifiers).
  *
- * @par Supported format specifiers
- * - @c \%d, @c \%i : signed decimal (@c int; @c int64_t with @c l / @c ll)
- * - @c \%u         : unsigned decimal (@c unsigned; @c uint64_t with @c l / @c ll)
- * - @c \%x         : unsigned hexadecimal, lowercase
- * - @c \%X         : unsigned hexadecimal, uppercase
- * - @c \%p         : pointer (printed as @c 0x..., lowercase hex)
- * - @c \%s         : null-terminated string (@c NULL prints "(null)")
- * - @c \%c         : single character
- * - @c \%\%        : literal percent sign
+ * @note All output paths insert @c \\r before every @c \\n. If a string
+ *       already contains @c \\r\\n sequences, the result will be
+ *       @c \\r\\r\\n.
  *
- * @par Length modifiers
- * - (none) : @c int / @c unsigned (32-bit after default promotion)
- * - @c l   : @c long (64-bit on x86-64 LP64)
- * - @c ll  : <code>long long</code> (64-bit)
- *
- * @note @c serial_puts() and the literal-character path in @c serial_printf()
- *       both insert @c \\r before @c \\n. If a @c \%s argument already
- *       contains @c \\r\\n sequences, the result will be @c \\r\\r\\n.
+ * @warning Output is synchronous: the caller spins on the UART with
+ *          interrupts disabled for the whole message. At 115200 baud
+ *          that is ~87 µs per character on real hardware. Never print
+ *          from a latency-sensitive path.
  */
 
 #include "serial.h"
+#include "format.h"
 #include "io.h"
 #include "spinlock.h"
 
 static spinlock_t serial_lock = SPINLOCK_INIT;
 
+/// Set once by @c serial_panic_enter(); never cleared.
+static volatile bool serial_panic_mode = false;
+
 // ── Initialization ─────────────────────────────────────────────────────
 
 void serial_init(uint16_t port, uint32_t baud)
 {
+    if (baud == 0 || baud > UART_BASE_CLOCK)
+        baud = UART_BASE_CLOCK;
+
     uint16_t divisor = UART_BASE_CLOCK / baud;
 
     // 1. Disable all interrupts
@@ -49,7 +47,7 @@ void serial_init(uint16_t port, uint32_t baud)
     outb(port + UART_LINE_CTRL,
          UART_LCR_WORD_8 | UART_LCR_PARITY_NONE | UART_LCR_STOP_1);
 
-    // 4. Enable and clear FIFOs with a 14-byte trigger threshold 
+    // 4. Enable and clear FIFOs with a 14-byte trigger threshold
     outb(port + UART_FIFO_CTRL,
          UART_FCR_ENABLE | UART_FCR_CLEAR_RX
          | UART_FCR_CLEAR_TX | UART_FCR_TRIGGER_14);
@@ -78,200 +76,74 @@ void serial_putchar(uint16_t port, char c)
     outb(port + UART_DATA, c);
 }
 
-/// Lock-free version of @c serial_puts, for use by @c serial_printf.
-static void serial_puts_internal(uint16_t port, const char *s)
+/// Write one character, translating @c \\n to @c \\r\\n.
+static void serial_put_translated(uint16_t port, char c)
 {
-    while (*s)
-    {
-        if (*s == '\n')
-            serial_putchar(port, '\r');
-        serial_putchar(port, *s++);
-    }
+    if (c == '\n')
+        serial_putchar(port, '\r');
+    serial_putchar(port, c);
 }
+
+// ── Console lock ───────────────────────────────────────────────────────
+
+/**
+ * @brief Disable interrupts and take the console lock.
+ *
+ * In panic mode the lock is skipped: the panicking core may itself hold
+ * it (a fault inside @c kprintf), and waiting would deadlock.
+ *
+ * @return @c true if the lock was taken (pass to @c console_unlock).
+ */
+static bool console_lock(uint64_t *flags)
+{
+    *flags = irq_save();
+    if (serial_panic_mode)
+        return false;
+    spin_lock(&serial_lock);
+    return true;
+}
+
+static void console_unlock(bool locked, uint64_t flags)
+{
+    if (locked)
+        spin_unlock(&serial_lock);
+    irq_restore(flags);
+}
+
+void serial_panic_enter(void)
+{
+    serial_panic_mode = true;
+}
+
+// ── String / formatted output ──────────────────────────────────────────
 
 void serial_puts(uint16_t port, const char *s)
 {
     uint64_t flags;
-    spin_lock_irqsave(&serial_lock, &flags);
+    bool locked = console_lock(&flags);
 
-    serial_puts_internal(port, s);
+    while (*s)
+        serial_put_translated(port, *s++);
 
-    spin_unlock_irqrestore(&serial_lock, flags);
+    console_unlock(locked, flags);
 }
 
-// ── printf internals ───────────────────────────────────────────────────
-
-/**
- * @brief Print an unsigned integer in the given base.
- *
- * @param port       UART base address.
- * @param value      Value to print.
- * @param base       Radix (2-16).
- * @param uppercase  If @c true, use uppercase hex digits (A-F)
- */
-static void serial_put_uint(uint16_t port, uint64_t value,
-                            int base, bool uppercase)
+/// @c kvformat sink: @p ctx carries the port number.
+static void serial_format_sink(void *ctx, char c)
 {
-    static const char digits_lower[] = "0123456789abcdef";
-    static const char digits_upper[] = "0123456789ABCDEF";
-    const char *digits = uppercase ? digits_upper : digits_lower;
-
-    // 65 chars covers a full 64-bit binary representation + NUL.
-    char buf[65];
-    int i = 0;
-
-    if (value == 0)
-    {
-        serial_putchar(port, '0');
-        return;
-    }
-
-    while (value > 0)
-    {
-        buf[i++] = digits[value % base];
-        value /= base;
-    }
-
-    while (i > 0)
-        serial_putchar(port, buf[--i]);
+    serial_put_translated((uint16_t)(uintptr_t)ctx, c);
 }
-
-/**
- * @brief Print a signed decimal integer in the given base.
- *
- * Negative values are prefixed with '-'; the magnitude is printed
- * via @c serial_put_uint to avoid undefined behavior with @c INT64_MIN.
- */
-static void serial_put_int(uint16_t port, int64_t value)
-{
-    if (value < 0)
-    {
-        serial_putchar(port, '-');
-        serial_put_uint(port, -(uint64_t)value, 10, false);
-    }
-    else
-        serial_put_uint(port, (uint64_t)value, 10, false);
-}
-
-// ── Formatted output ───────────────────────────────────────────────────
-
-/// Length modifier state for printf parsing.
-typedef enum
-{
-    LEN_NONE,       ///< @c int / @c unsigned
-    LEN_LONG,       ///< @c long / <code>unsigned long</code> (64-bit on LP64)
-    LEN_LONG_LONG,  ///< <code>long long</code> / <code>unsigned long long</code>
-} printf_length_t;
 
 void serial_printf(uint16_t port, const char *fmt, ...)
 {
     uint64_t flags;
-    spin_lock_irqsave(&serial_lock, &flags);
+    bool locked = console_lock(&flags);
 
     __builtin_va_list args;
     __builtin_va_start(args, fmt);
-
-    while (*fmt)
-    {
-        if (*fmt != '%')
-        {
-            if (*fmt == '\n')
-                serial_putchar(port, '\r');
-            serial_putchar(port, *fmt++);
-            continue;
-        }
-
-        fmt++;  // skip '%'
-        if (*fmt == '\0')
-        {
-            serial_putchar(port, '%');
-            break;
-        }
-
-        // Parse length modifier
-        printf_length_t length = LEN_NONE;
-        if (*fmt == 'l')
-        {
-            fmt++;
-            if (*fmt == 'l')
-            {
-                length = LEN_LONG_LONG;
-                fmt++;
-            }
-            else
-                length = LEN_LONG;
-        }
-
-        // Dispatch on conversion specifier
-        switch (*fmt)
-        {
-        case 'd':
-        case 'i':
-        {
-            int64_t val;
-            if (length >= LEN_LONG)
-                val = __builtin_va_arg(args, int64_t);
-            else
-                val = __builtin_va_arg(args, int);
-            serial_put_int(port, val);
-            break;
-        }
-        case 'u':
-        {
-            uint64_t val;
-            if (length >= LEN_LONG)
-                val = __builtin_va_arg(args, uint64_t);
-            else
-                val = __builtin_va_arg(args, unsigned int);
-            serial_put_uint(port, val, 10, false);
-            break;
-        }
-        case 'x':
-        case 'X':
-        {
-            uint64_t val;
-            if (length >= LEN_LONG)
-                val = __builtin_va_arg(args, uint64_t);
-            else
-                val = __builtin_va_arg(args, unsigned int);
-            serial_put_uint(port, val, 16, *fmt == 'X');
-            break;
-        }
-        case 'p':
-            serial_puts_internal(port, "0x");
-            serial_put_uint(port,
-                            (uintptr_t)__builtin_va_arg(args, void *), 
-                            16, false);
-            break;
-        case 's':
-        {
-            const char *s = __builtin_va_arg(args, const char *);
-            serial_puts_internal(port, s ? s : "(null)");
-            break;
-        }
-        case 'c':
-        {
-            char ch = (char)__builtin_va_arg(args, int);
-            if (ch == '\n')
-                serial_putchar(port, '\r');
-            serial_putchar(port, ch);
-            break;
-        }
-        case '%':
-            serial_putchar(port, '%');
-            break;
-        default:
-            // Unknown specifier - print literally
-            serial_putchar(port, '%');
-            serial_putchar(port, *fmt);
-            break;
-        }
-
-        fmt++;
-    }
-
+    kvformat(serial_format_sink, (void *)(uintptr_t)port, fmt, args);
     __builtin_va_end(args);
 
-    spin_unlock_irqrestore(&serial_lock, flags);
+    console_unlock(locked, flags);
 }
 
