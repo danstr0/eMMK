@@ -135,6 +135,10 @@ static void dump_page_fault(struct interrupt_frame *frame)
  */
 NORETURN static void default_exception_handler(struct interrupt_frame *frame)
 {
+    // This core may have faulted while holding the console lock; bypass
+    // it so the report below cannot deadlock
+    serial_panic_enter();
+
     const char *name = "Unknown Exception";
     if (frame->vector < EXCEPTION_COUNT && exception_names[frame->vector])
         name = exception_names[frame->vector];

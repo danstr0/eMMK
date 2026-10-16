@@ -5,6 +5,7 @@ eMMK — low-latency networking kernel
    :maxdepth: 2
    :caption: Kernel Architecture
 
+   architecture/build_system
    architecture/boot_process
    architecture/smp
    architecture/tss_percpu
@@ -26,6 +27,8 @@ eMMK — low-latency networking kernel
    klib/endian
    klib/io_primitives
    klib/spinlock
-   klin/string_memory
+   klib/string_memory
+   klib/console_logging
 
 * `API Reference (Doxygen) <api/index.html>`_
+

@@ -12,7 +12,7 @@
 ;;; 5. Call @c kernel_main() with the Multiboot2 info pointer.
 ;;;
 ;;; @par Section layout
-;;; @c long_mode_start resides in @c .text_32 (VMA == LMA) because it is the
+;;; @c long_mode_start resides in @c .text32 (VMA == LMA) because it is the
 ;;; target of a 32-bit far jump whose offset must be a physical address.
 ;;; After initial setup it jumps to @c higher_half_entry in @c .text
 ;;; (higher-half VMA).
@@ -45,16 +45,17 @@ GDT64_DATA_SEG equ 0x10
 ;;; @brief First code executed in 64-bit mode.
 ;;;
 ;;; @pre  Paging is active (identity + higher-half mappings).
-;;; @pre  RDI contains the physical address of the Multiboot2 info structure
-;;;       (zero-extended from EDI, set by multiboot2.asm).
-;;; @post @c kernel_main() has been called with a higher-half pointer to the
-;;;       Multiboot2 information structure.
+;;; @pre  EDI contains the physical address of the Multiboot2 info
+;;;       structure (set by multiboot2.asm). The upper 32 bits of RDI
+;;;       are undefined.
+;;; @post @c kernel_main() has been called with a higher-half pointer to
+;;;       the Multiboot2 information structure.
 ;;; @{
 
 long_mode_start:
     ;; 1. Save the Multiboot2 info pointer in a callee-saved register
     ;;    before anything can clobber RDI.
-    mov r15, rdi
+    mov r15d, edi
 
     ;; 2. Load the 64-bit data segment into all data/stack segment registers.
     ;;    CS was set by the far jump from 32-bit mode.
@@ -103,10 +104,14 @@ higher_half_entry:
     mov rdi, r15
     add rdi, KERNEL_VIRTUAL_BASE
 
-    ;; 7. Ensure 16-byte stack alignment (System V AMD64 ABI requirement).
+    ;; TODO: this assumes the MBI lies below 1 GiB (the extent of the boot
+    ;; mapping). GRUB usually places it low, but nothing guarantees it on
+    ;; machines with large amounts of RAM.
+
+    ;; 8. Ensure 16-byte stack alignment (System V AMD64 ABI requirement).
     and rsp, ~0xF
 
-    ;; 8. Enter the C kernel.
+    ;; 9. Enter the C kernel.
     call kernel_main
 
     ;; If kernel_main() returns, halt permanently.
@@ -126,6 +131,12 @@ higher_half_entry:
 ;;; can initialize ESP before paging is available. After the transition to
 ;;; higher-half code, RSP is relocated to the equivalent higher-half alias
 ;;; so the stack remains accessible once the identity mapping is torn down.
+;;;
+;;; @warning This stack has no guard page. The linker places it directly
+;;;          above @c .boot_page_tables, which remain in the live page
+;;;          tables. Overflowing the BSP stack silently corrupts the PD.
+;;;          To be fixed when the VMM builds the kernel's own page tables.
+;;;
 ;;; @{
 
 section .boot_stack nobits alloc write

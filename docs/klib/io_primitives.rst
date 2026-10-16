@@ -62,7 +62,7 @@ These map to the ``REP INS`` and ``REP OUTS`` instructions.
    * - ``insl(port, addr, count)``
      - Reads count 32-bit dwords from ``port`` into the buffer at ``addr``.
    * - ``outsl(port, addr, count)``
-     - Writes count 32-bit dwords from the buffer at ``addr`` to port``.
+     - Writes count 32-bit dwords from the buffer at ``addr`` to ``port``.
 
 .. note::
 
@@ -122,10 +122,18 @@ MMIO access requires strict adherence to two rules, which these primitives handl
    MMIO accesses across other memory operations.
 
 .. warning::
-   These primitives handle **compiler** reordering only. On some
-   architectures or complex bus topologies, additional **hardware** memory
-   barriers (like``mfence``) may be required to ensure visibility to the
-   device.
+   These primitives handle **compiler** reordering only. On x86 that is
+   enough for the common cases. A hardware fence **is** needed for
+   write-combining (WC) mappings, and for store→load ordering on WB memory
+   shared with a device (see :doc:`core_types`, *x86 ordering*).
+
+
+Cost of I/O on the Data Path
+============================
+Every port I/O instruction is slow — on the order of a microsecond on
+real hardware. Hot paths should touch device registers as rarely as
+possible: batch doorbell writes, read status from memory the device
+updates via DMA rather than from registers, and keep polling loops on RAM.
 
 
 References

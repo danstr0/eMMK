@@ -43,7 +43,10 @@ Exact-width types
 
 These are defined in terms of the fundamental C types for the x86-64
 LP64 data model (``char`` = 8, ``short`` = 16, ``int`` = 32,
-``long long`` = 64 bits).
+``long`` = 64 bits). ``int64_t`` and ``uint64_t`` are ``long`` /
+``unsigned long``, matching GCC's own ``<stdint.h>`` on x86-64, so
+``%ld`` / ``%lu`` / ``%lx`` are the correct format specifiers and the
+``UL`` literal suffix produces a ``uint64_t``.
 
 Pointer and size types
 ----------------------
@@ -197,7 +200,7 @@ Bit Manipulation
    :widths: 30 50
 
    * - ``BIT(n)``
-     - ``1ULL << n`` — a single-bit mask.
+     - ``1UL << n`` — a single-bit mask.
    * - ``SET_BIT(x, n)``
      - Set bit *n* in *x*.
    * - ``CLEAR_BIT(x, n)``
@@ -207,15 +210,13 @@ Bit Manipulation
    * - ``TOGGLE_BIT(x, n)``
      - Flip bit *n* in *x*.
 
-``BIT`` uses ``1ULL`` (unsigned 64-bit) to avoid undefined behaviour
-when *n* ≥ 32.
+``BIT`` uses ``1UL`` (unsigned 64-bit on LP64) to avoid undefined
+behaviour when *n* ≥ 32.
 
 
 Compiler Attributes
 ===================
-These macros wrap GCC/Clang ``__attribute__`` syntax. They are
-functional in both the freestanding kernel build and the hosted test
-build (both use GCC-compatible compilers).
+These macros wrap GCC ``__attribute__`` syntax.
 
 .. list-table::
    :widths: 25 50
@@ -246,8 +247,7 @@ hardware and shared-memory devices (virtio rings, MMIO registers).
 ``barrier()``
    Compiler memory barrier — prevents the compiler from reordering
    memory accesses across this point. Does **not** emit a CPU fence
-   instruction; on x86, stores are naturally ordered, so a compiler
-   barrier suffices for most driver→device communication.
+   instruction. See *x86 ordering* below for when that is enough.
 
    .. code-block:: c
 
@@ -275,7 +275,22 @@ hardware and shared-memory devices (virtio rings, MMIO registers).
    - **Reordering** the access relative to adjacent memory operations.
 
    Used for MMIO registers and any memory location shared with
-   hardware or (in the future) other cores.
+   hardware or other cores.
+
+x86 ordering
+------------
+x86-64 uses Total Store Order (TSO) for ordinary (write-back) memory:
+
+- loads are not reordered with other loads;
+- stores are not reordered with other stores;
+- stores are not reordered with *earlier* loads;
+- **a load may be reordered before an earlier store to a different
+  address**.
+
+A compiler barrier is sufficient for publish/consume patterns — which
+covers spinlock release, SPSC rings, and virtio descriptor → doorbell
+sequences. Anything that needs *store then load* ordering across cores
+needs a real fence: ``mfence`` or any ``lock``-prefixed instruction.
 
 
 References
@@ -300,5 +315,5 @@ Related Files
 - ``include/types.h``
 - ``include/kernel.h``
 - ``include/io.h``
-- ``tests/test_types.c``
+- ``test/test_types.c``
 

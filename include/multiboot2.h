@@ -167,7 +167,13 @@ struct multiboot2_mmap_entry
     uint32_t reserved;
 } PACKED;
 
-/// ACPI 1.0 RSDP (Root System Description Pointer).
+/**
+ * @brief ACPI 1.0 RSDP (Root System Description Pointer).
+ *
+ * TODO: The ACPI tags are the entry point for real-hardware platform
+ * discovery. They are defined here but not yet consumed; QEMU's
+ * sequential APIC IDs and fixed IOAPIC address hide their absence.
+ */
 struct multiboot2_tag_acpi_old
 {
     uint32_t type;
@@ -238,7 +244,7 @@ multiboot2_get_tag(struct multiboot2_info *info, uint32_t type)
             return NULL;
 
         uintptr_t next = (uintptr_t)tag + tag->size;
-        tag = (struct multiboot2_tag *)((next + 7) & ~7ULL);
+        tag = (struct multiboot2_tag *)((next + 7) & ~7UL);
     }
 
     return NULL;

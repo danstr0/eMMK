@@ -155,7 +155,8 @@ void serial_puts(uint16_t port, const char *s);
 /**
  * @brief Write formatted output to a serial port.
  *
- * Supports a subset of standard printf format specifiers.
+ * Supports the integer, pointer, string, and character conversions with
+ * full flag / width / precision / length syntax; see format.h.
  *
  * Output is internally serialized and safe to call concurrently from
  * multiple CPUs and interrupt contexts.
@@ -166,6 +167,16 @@ void serial_puts(uint16_t port, const char *s);
  */
 PRINTF_FMT(2, 3)
 void serial_printf(uint16_t port, const char *fmt, ...);
+
+/**
+ * @brief Switch console output to lock-free panic mode (irreversible).
+ *
+ * Called by fatal exception handlers before printing. From then on,
+ * @c serial_puts / @c serial_printf no longer take the console lock, so a
+ * core that faulted while holding it can still print its panic report.
+ * Output from several cores may interleave.
+ */
+void serial_panic_enter(void);
 /// @}
 
 /// @name Kernel console convenience macros

@@ -7,8 +7,8 @@ Overview
 eMMK provides a freestanding, zero-dependency implementation of the
 standard C string library (``string.h``). Because the kernel does not link
 against a hosted C standard library, these functions provide the essential
-primitives for memory manipulation and string parsing used by the VMM,
-and drivers.
+primitives for memory manipulation and string parsing used throughout
+the kernel.
 
 **Design Principles:**
 
@@ -21,9 +21,23 @@ and drivers.
 
 Memory Operations
 =================
-Memory functions operate on raw byte buffers. These are often optimized by
-the compiler into specialized instructions (like ``rep stosb`` or ``rep movsq``)
-depending on the architecture and optimization level.
+Memory functions operate on raw byte buffers.
+
+Implementation
+--------------
+- **Builtin routing.** ``-ffreestanding`` implies ``-fno-builtin``, which
+  would make every ``memcpy`` — even a 6-byte MAC copy — an out-of-line
+  call. ``string.h`` therefore maps ``memset``, ``memcpy``, ``memmove``,
+  and ``memcmp`` to ``__builtin_*``: GCC expands small constant-size
+  operations inline (a few ``mov`` instructions) and calls the real
+  function otherwise.
+- **Bulk routines.** The out-of-line ``memset`` / ``memcpy`` use
+  ``rep stosb`` / ``rep movsb``. On CPUs with ERMSB these are the fastest
+  bulk routines available without vector registors (which the kernel
+  cannot yet use).
+- **No self-recursion.** The build passes
+  ``-fno-tree-loop-distribute-patterns`` so GCC never rewrites a loop
+  inside ``string.c`` into a call to the very function being defined.
 
 .. list-table:: **Memory Primitives**
    :header-rows: 1
@@ -113,13 +127,12 @@ against the buffer size:
    }
 
 
-Legacy and Deprecated APIs
+Intentionally Omitted APIs
 ==========================
-The following functions are provided only for compatibility with imported
-third-party code. Their use in new eMMK kernel code is strictly prohibited
-and will trigger compiler warnings.
+The following standard functions are **not provided**. Code that calls
+them fails to link; use the replacement instead.
 
-.. list-table:: **Deprecated Functions**
+.. list-table:: **Omitted Functions**
    :header-rows: 1
    :widths: 20 30 50
 
@@ -140,10 +153,18 @@ and will trigger compiler warnings.
      - Confusing "size" semantics (size of append vs size of buffer).
 
 
+Formatted Output into Buffers
+=============================
+``ksnprintf`` / ``kvsnprintf`` (``include/format.h``) format into a
+fixed-size buffer with ``snprintf`` semantics: always null-terminated,
+and the return value is the untruncated length. They share the formatting
+engine with ``kprintf``; see :doc:`console_logging`.
+
+
 References
 ==========
-- `ISO/IEC 9899:2024 (C23)`
-  - §7.26 (``<string.h>``).
+- `ISO/IEC 9899:2018 (C17)`
+  - §7.24 (``<string.h>``).
 - `OpenBSD Manual
   <https://man.openbsd.org/strlcat.3>`_
   - ``strlcpy``, ``strlcat``.
@@ -155,6 +176,8 @@ References
 Related Files
 =============
 - ``include/string.h``
-- ``kernel/lib/string.c``
-- ``include/types.h``
+- ``kernel/string.c``
+- ``include/format.h``
+- ``kernel/format.c``
+- ``test/test_string.c``
 

@@ -21,20 +21,26 @@ GRUB   := grub-mkrescue
 
 # ── Compiler / assembler / linker flags ─────────────────────────────────
 
-CFLAGS := -std=c17 -ffreestanding       \
-          -mno-red-zone -mcmodel=kernel \
-          -fno-pic -fno-pie             \
-          -mno-sse -mno-mmx -mno-avx    \
-          -fno-stack-protector          \
-          -Wall -Wextra -Werror         \
-          -Iinclude                     \
+CFLAGS := -std=c17 -ffreestanding -O2        \
+          -fno-strict-aliasing               \
+          -fno-tree-loop-distribute-patterns \
+          -fcf-protection=none               \
+          -fno-stack-clash-protection        \
+          -fno-asynchronous-unwind-tables    \
+          -mno-red-zone -mcmodel=kernel      \
+          -fno-pic -fno-pie                  \
+          -mno-sse -mno-mmx -mno-avx         \
+          -fno-stack-protector               \
+          -Wall -Wextra -Werror              \
+          -Iinclude                          \
           -MMD -MP
 
 NASMFLAGS := -f elf64
 
 LDFLAGS := -nostdlib               \
            -T kernel/linker.ld     \
-           -z max-page-size=0x1000
+           -z max-page-size=0x1000 \
+           --orphan-handling=error
 
 # ── QEMU flags ──────────────────────────────────────────────────────────
 
@@ -47,13 +53,13 @@ QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
 			boot/ap_trampoline.asm
 
-KERN_SRC := kernel/serial.c kernel/string.c kernel/idt.c            \
-			kernel/pic.c kernel/apic.c kernel/timer.c               \
-			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c  \
-			kernel/log.c kernel/spsc.c kernel/bench.c               \
-			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                   \
-			drivers/pci.c drivers/virtio.c drivers/net/virtio_net.c \
-			net/netbuf.c net/ethernet.c net/netdev.c                \
+KERN_SRC := kernel/serial.c kernel/format.c kernel/string.c kernel/idt.c \
+			kernel/pic.c kernel/apic.c kernel/timer.c                    \
+			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c       \
+			kernel/log.c kernel/spsc.c kernel/bench.c                    \
+			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                        \
+			drivers/pci.c drivers/virtio.c drivers/net/virtio_net.c      \
+			net/netbuf.c net/ethernet.c net/netdev.c                     \
 			net/arp.c net/ip.c net/icmp.c net/udp.c net/dispatch.c
 
 TEST_SRC := test/test_main.c test/test_types.c test/test_string.c \
@@ -71,7 +77,7 @@ TEST_OBJ := $(patsubst %.c,   build/%.o, $(TEST_SRC))
 
 # ── Top-level targets ───────────────────────────────────────────────────
 
-.PHONY: all run test clean
+.PHONY: all run test demo clean
 
 all: build/os.iso
 

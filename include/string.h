@@ -33,6 +33,21 @@ int memcmp(const void *s1, const void *s2, size_t n);
 /// Returns @c NULL if not found.
 void *memchr(const void *s, int c, size_t n);
 
+/**
+ * @brief Route the core memory functions through GCC builtins.
+ *
+ * @c -ffreestanding implies @c -fno-builtin, so without these mappings
+ * every call is an out-of-line call. Through @c __builtin_*, GCC expands
+ * small constant-size operations inline and still emits a call to the
+ * real function otherwise.
+ */
+#ifndef EMMK_STRING_IMPL
+#define memset(dest, c, n)    __builtin_memset((dest), (c), (n))
+#define memcpy(dest, src, n)  __builtin_memcpy((dest), (src), (n))
+#define memmove(dest, src, n) __builtin_memmove((dest), (src), (n))
+#define memcmp(s1, s2, n)     __builtin_memcmp((s1), (s2), (n))
+#endif
+
 /// Zero @p n bytes starting at @p dest.
 static inline void memzero(void *dest, size_t n)
 {

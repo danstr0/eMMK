@@ -59,7 +59,7 @@ multiboot2_header_start:
 
     ;; Framebuffer tag - request 80x25 text mode.
     align 8
-    dw 5, 0     ; type = 5 (framebuffer), flags = 0 (optional)
+    dw 5, 1     ; type = 5 (framebuffer), flags = 1 (optional)
     dd 20       ; tag size in bytes
     dd 80       ; width  (columns)
     dd 25       ; height (rows)
@@ -223,6 +223,9 @@ PAGE_HUGE     equ (1 << 7)
 ;;; - @c 0x0000_0000_0000_0000 -> physical 0x0 (identity)
 ;;; - @c 0xFFFF_FFFF_8000_0000 -> physical 0x0 (higher-half / kernel)
 ;;;
+;;; TODO: On real hardware, either load the kernel at >= 2 MiB or map the
+;;;       first 2 MiB with 4 KiB pages.
+;;;
 setup_page_tables:
     ;; Zero all three page tables (3 * 4096 bytes)
     ;;   these are contiguous - pml4 | pdpt | pd
@@ -295,11 +298,14 @@ CR0_MP         equ (1 << 1)   ; Coprocessor Monitoring
 CR4_OSFXSR     equ (1 << 9)   ; OS supports FXSAVE/FXRSTOR
 CR4_OSXMMEXCPT equ (1 << 10)  ; OS supports unmasked SIMD FP exceptions
 
-;;; @brief Enable SSE/SSE2 to prevent @c \#UD faults.
-;;
-;;; Some compilers emit SSE instructions even when @c -mno-sse is specified
-;;; (e.g., for structure copies). Enabling SSE early avoids unexpected
-;;; faults during kernel initialization.
+;;; @brief Enable SSE/SSE2 execution (CR0.EM clear, CR4.OSFXSR set).
+;;;
+;;; The kernel is compiled with @c -mno-sse, so compiled C never uses SSE
+;;; registers. This is such that any stray SSE instruction executes
+;;; instead of raising @c \#UD.
+;;;
+;;; @warning Any code that does use SSE must not be interruptible, or
+;;;          must save and restore the state itself (@c FXSAVE, @c XSAVE).
 enable_sse:
     mov eax, cr0
     and eax, ~CR0_EM  ; clear Emulation flag

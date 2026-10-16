@@ -40,7 +40,8 @@ SECTIONS
      * tables, and the boot stack reside here at physical addresses so that
      * they are valid both before paging is enabled and afterwards (via
      * the identity mapping).
-     * ─────────────────────────────────────────────────────────────────── */
+     * ───────────────────────────────────────────────────────────────────
+     */
     . = 1M;
     _kernel_physical_start = .;
 
@@ -61,12 +62,12 @@ SECTIONS
         *(.boot_stack)
     }
 
-    /* 
+    /* ───────────────────────────────────────────────────────────────────
      * AP trampoline - kept in the kernel image at its linked address
      *
-     * smp_init() copies it to AP_TRAMPOLINE_ADDR(0x8000) at runtime 
+     * smp_init() copies it to AP_TRAMPOLINE_ADDR(0x8000) at runtime
+     * ───────────────────────────────────────────────────────────────────
      */
-
     .ap_trampoline ALIGN(4K) : AT(ADDR(.ap_trampoline))
     {
         _ap_trampoline_lma = .;
@@ -80,23 +81,27 @@ SECTIONS
      * virtual addresses starting at KERNEL_VIRTUAL_BASE + current
      * physical offset, with AT() translating back to physical for
      * loading.
-     * ─────────────────────────────────────────────────────────────────── */
+     * ───────────────────────────────────────────────────────────────────
+     */
     . += KERNEL_VIRTUAL_BASE;
     _kernel_virtual_start = .;
 
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRTUAL_BASE)
     {
         *(.text)
+        *(.text.*)
     }
 
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRTUAL_BASE)
     {
         *(.rodata)
+        *(.rodata.*)
     }
 
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VIRTUAL_BASE)
     {
         *(.data)
+        *(.data.*)
     }
 
     .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VIRTUAL_BASE)
@@ -104,15 +109,49 @@ SECTIONS
         __bss_start = .;
         *(COMMON)
         *(.bss)
+        *(.bss.*)
         __bss_end = ALIGN(8);
     }
+
+    /* ───────────────────────────────────────────────────────────────────
+     * Linker-synthesized dynamic-linking sections. The kernel is built
+     * -fno-pic and statically linked, so these must all be empty.
+     * ───────────────────────────────────────────────────────────────────
+     */
+    .got : AT(ADDR(.got) - KERNEL_VIRTUAL_BASE)
+    {
+        *(.got)
+        *(.igot.*)
+    }
+    ASSERT(SIZEOF(.got) == 0, "Unexpected GOT entries")
+
+    .got.plt : AT(ADDR(.got.plt) - KERNEL_VIRTUAL_BASE)
+    {
+        *(.got.plt)
+    }
+    ASSERT(SIZEOF(.got.plt) == 0, "Unexpected GOT.PLT entries")
+
+    .plt : AT(ADDR(.plt) - KERNEL_VIRTUAL_BASE)
+    {
+        *(.plt)
+        *(.plt.*)
+        *(.iplt)
+    }
+    ASSERT(SIZEOF(.plt) == 0, "Unexpected PLT entries")
+
+    .rela.dyn : AT(ADDR(.rela.dyn) - KERNEL_VIRTUAL_BASE)
+    {
+        *(.rela.*)
+    }
+    ASSERT(SIZEOF(.rela.dyn) == 0, "Unexpected run-time relocations")
 
     _kernel_virtual_end = .;
     _kernel_physical_end = . - KERNEL_VIRTUAL_BASE;
 
     /* ───────────────────────────────────────────────────────────────────
      * Discarded sections
-     * ─────────────────────────────────────────────────────────────────── */
+     * ───────────────────────────────────────────────────────────────────
+     */
     /DISCARD/ :
     {
         *(.eh_frame)

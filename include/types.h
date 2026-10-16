@@ -135,7 +135,7 @@ STATIC_ASSERT(sizeof(size_t)    == 8, "size_t must be 8 bytes on x86-64");
 
 /// @name Bit manipulation
 /// @{
-#define BIT(n)            (1ULL << (n))
+#define BIT(n)            (1UL << (n))
 #define SET_BIT(x, n)     ((x) |= BIT(n))
 #define CLEAR_BIT(x, n)   ((x) &= ~BIT(n))
 #define TEST_BIT(x, n)    ((x) & BIT(n))
