@@ -85,17 +85,21 @@ uint32_t test_netbuf(void)
 
         // Simulate a received Ethernet frame
         uint8_t *frame = netbuf_put(nb, 64);
-        memset(frame, 0xBB, 64);
-        frame[0] = 0xDE;  // marker in the "header"
-        frame[14] = 0xAD; // marker in the "payload"
+        TEST_ASSERT(frame != NULL, "put for pull test");
+        if (frame)
+        {
+            memset(frame, 0xBB, 64);
+            frame[0] = 0xDE;  // marker in the "header"
+            frame[14] = 0xAD; // marker in the "payload"
 
-        void *old = netbuf_pull(nb, 14);
-        TEST_ASSERT(old != NULL, "pull returns non-NULL");
-        TEST_ASSERT_EQ(((uint8_t *)old)[0], 0xDE,
-                       "pull returns old data start");
-        TEST_ASSERT_EQ(nb->data[0], 0xAD,
-                       "data now points to payload");
-        TEST_ASSERT_EQ(nb->len, 50, "len after pull");
+            void *old = netbuf_pull(nb, 14);
+            TEST_ASSERT(old != NULL, "pull returns non-NULL");
+            TEST_ASSERT_EQ(((uint8_t *)old)[0], 0xDE,
+                           "pull returns old data start");
+            TEST_ASSERT_EQ(nb->data[0], 0xAD,
+                           "data now points to payload");
+            TEST_ASSERT_EQ(nb->len, 50, "len after pull");
+        }
 
         netbuf_free(nb);
     }
