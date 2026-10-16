@@ -5,6 +5,7 @@
  */
 
 #include "test.h"
+#include "format.h"
 
 uint32_t test_string(void)
 {
@@ -188,6 +189,105 @@ uint32_t test_string(void)
         for (size_t i = 0; i < sizeof(buf); ++i)
             if (buf[i] != 0) { ok = false; break; }
         TEST_ASSERT(ok, "memzero clears buffer");
+    }
+
+    // ── Out-of-line mem* (runtime sizes) ────────────────
+    {
+        static uint8_t a[4096 + 64], b[4096 + 64];
+        volatile size_t n = 4096 + 3;
+
+        for (size_t i = 0; i < sizeof(a); ++i)
+            a[i] = (uint8_t)(i * 7);
+
+        memset(b, 0, sizeof(b));
+        memcpy(b + 1, a + 2, n);
+        bool ok = (b[0] == 0) && (b[n + 1] == 0);
+        for (size_t i = 0; ok && i < n; ++i)
+            ok = (b[i + 1] == a[i + 2]);
+        TEST_ASSERT(ok, "memcpy runtime size, unaligned, bounded");
+
+        memset(b + 5, 0x5A, n);
+        ok = (b[4] != 0x5A || a[2] == 0x5A) && (b[n + 5] == 0);
+        for (size_t i = 0; ok && i < n; ++i)
+            ok = (b[i + 5] == 0x5A);
+        TEST_ASSERT(ok, "memset runtime size");
+
+        // Overlap, dest above src (backward path)
+        volatile size_t m = 100;
+        for (size_t i = 0; i < 200; ++i)
+            b[i] = (uint8_t)i;
+        memmove(b + 10, b, m);
+        ok = true;
+        for (size_t i = 0; ok && i < m; ++i)
+            ok = (b[i + 10] == (uint8_t)i);
+        TEST_ASSERT(ok, "memmove overlap, dest > src");
+
+        // Overlap, dest below src (forward path)
+        for (size_t i = 0; i < 200; ++i)
+            b[i] = (uint8_t)i;
+        memmove(b, b + 10, m);
+        ok = true;
+        for (size_t i = 0; ok && i < m; ++i)
+            ok = (b[i] == (uint8_t)(i + 10));
+        TEST_ASSERT(ok, "memmove overlap, dest < src");
+    }
+
+    // ── ksnprintf: flags, width, precision, length ──────
+    {
+        char buf[64];
+
+        ksnprintf(buf, sizeof(buf), "%08x", 0xbeefu);
+        TEST_ASSERT_STREQ(buf, "0000beef", "fmt %08x zero pad");
+
+        ksnprintf(buf, sizeof(buf), "%02x:%02x", 1u, 0xabu);
+        TEST_ASSERT_STREQ(buf, "01:ab", "fmt %02x MAC-style");
+
+        ksnprintf(buf, sizeof(buf), "%-5d|", 42);
+        TEST_ASSERT_STREQ(buf, "42   |", "fmt %-5d left justify");
+    
+        ksnprintf(buf, sizeof(buf), "%5s", "ab");
+        TEST_ASSERT_STREQ(buf, "   ab", "fmt %5s right justify");
+    
+        ksnprintf(buf, sizeof(buf), "%.3s", "abcdef");
+        TEST_ASSERT_STREQ(buf, "abc", "fmt %.3s precision");
+    
+        ksnprintf(buf, sizeof(buf), "%*d|%-*d", 4, 7, 3, 1);
+        TEST_ASSERT_STREQ(buf, "   7|1  ", "fmt * width");
+    
+        ksnprintf(buf, sizeof(buf), "%+d % d %d", 5, 5, -5);
+        TEST_ASSERT_STREQ(buf, "+5  5 -5", "fmt sign flags");
+
+        ksnprintf(buf, sizeof(buf), "%ld", (long)(-9223372036854775807L - 1));
+        TEST_ASSERT_STREQ(buf, "-9223372036854775808", "fmt INT64_MIN");
+
+        ksnprintf(buf, sizeof(buf), "%lu", 18446744073709551615UL);
+        TEST_ASSERT_STREQ(buf, "18446744073709551615", "fmt UINT64_MAX");
+
+        ksnprintf(buf, sizeof(buf), "%#x %#x %#o", 255u, 0u, 8u);
+        TEST_ASSERT_STREQ(buf, "0xff 0 010", "fmt # alternate forms");
+
+        ksnprintf(buf, sizeof(buf), "%.5d|%.0d|", 42, 0);
+        TEST_ASSERT_STREQ(buf, "00042||", "fmt integer precision");
+
+        ksnprintf(buf, sizeof(buf), "%zu %hhu %hd", (size_t)123, 300, 70000);
+        TEST_ASSERT_STREQ(buf, "123 44 4464", "fmt z / hh / h lengths");
+
+        ksnprintf(buf, sizeof(buf), "%p %c %%", (void *)0x1000, 'k');
+        TEST_ASSERT_STREQ(buf, "0x1000 k %", "fmt %p %c %%");
+
+        const char *volatile null_str = NULL;
+        ksnprintf(buf, sizeof(buf), "%s", null_str);
+        TEST_ASSERT_STREQ(buf, "(null)", "fmt NULL string");
+
+        // Unknown conversion is printed literally and consumes nothing.
+        // (Non-literal format so -Wformat does not reject it.)
+        const char *volatile unknown = "%q|%d";
+        ksnprintf(buf, sizeof(buf), unknown, 5);
+        TEST_ASSERT_STREQ(buf, "%q|5", "fmt unknown conversion");
+
+        size_t ret = ksnprintf(buf, 4, "%s", "abcdef");
+        TEST_ASSERT_STREQ(buf, "abc", "ksnprintf truncates");
+        TEST_ASSERT_EQ(ret, 6, "ksnprintf returns untruncated length");
     }
 
     TEST_END();
