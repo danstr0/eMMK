@@ -1,26 +1,36 @@
 /**
  * @file string.c
  * @brief Freestanding string and memory manipulation.
+ *
+ * @c memset and @c memcpy (and forward @c memmove) use `rep stosb`
+ * / `rep movsb`.
+ *
+ * Writing them in inline asm guarantees GCC cannot "optimize" a byte loop
+ * inside @c memcpy into a call to @c memcpy itself.
  */
 
+#define EMMK_STRING_IMPL
 #include "string.h"
 
 // ── Memory operations ──────────────────────────────────────────────────
 
 void *memset(void *dest, int c, size_t n)
 {
-    uint8_t *p = (uint8_t *)dest;
-    while (n--)
-        *p++ = (uint8_t)c;
+    void *d = dest;
+    __asm__ volatile("rep stosb"
+                     : "+D"(d), "+c"(n)
+                     : "a"(c)
+                     : "memory");
     return dest;
 }
 
 void *memcpy(void *dest, const void *src, size_t n)
 {
-    uint8_t       *d = (uint8_t *)dest;
-    const uint8_t *s = (const uint8_t *)src;
-    while (n--)
-        *d++ = *s++;
+    void *d = dest;
+    __asm__ volatile("rep movsb"
+                     : "+D"(d), "+S"(src), "+c"(n)
+                     :
+                     : "memory");
     return dest;
 }
 
@@ -29,16 +39,15 @@ void *memmove(void *dest, const void *src, size_t n)
     uint8_t       *d = (uint8_t *)dest;
     const uint8_t *s = (const uint8_t *)src;
 
-    if (d < s)
-        while (n--)
-            *d++ = *s++;
-    else
-    {
-        d += n;
-        s += n;
-        while (n--)
-            *--d = *--s;
-    }
+    // A forward copy is safe unless dest starts inside [src, src + n)
+    if (d <= s || d >= s + n)
+        return memcpy(dest, src, n);
+
+    // Otherwise, copy backwards with a plain loop
+    d += n;
+    s += n;
+    while (n--)
+        *--d = *--s;
     return dest;
 }
 
