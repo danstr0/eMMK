@@ -17,8 +17,8 @@ Design
 
 Data Layout
 -----------
-The ``spinlock_t`` structure packs two 16-bit counters into a single
-32-bit aligned word:
+The ``spinlock_t`` structure packs two 16-bit counters into 4 bytes
+(2-byte aligned; nothing operates on the pair as one 32-bit word):
 
 .. code-block:: c
 
@@ -91,7 +91,33 @@ before modifying ``owner``:
 
 On standard x86-64 memory architecture (TSO — Total Store Order), scalar
 writes are strictly ordered with respect to other writes, making an
-explicit hardware bus lock unnecessary during release.
+explicit hardware bus lock unnecessary during release. The increment
+itself is a plain (non-atomic) read-modify-write, which is safe because
+only the lock holder ever writes ``owner``.
+
+``spin_trylock`` reads ``owner`` and then compare-and-swaps ``next`` from
+that value to ``value + 1``. It succeeds only if ``next == owner`` at the
+instant of the swap (the lock was free), and since ``owner`` only ever
+increases, the ticket it takes is the one being served.
+
+
+Latency Considerations
+======================
+eMMK's data path avoids locks entirely (per-core state, SPSC rings,
+per-core slab magazines). Where locks remain, keep in mind:
+
+- **Interrupts stay disabled for the whole critical section** under
+  ``spin_lock_irqsave``. Pending timer interrupts will be deferred, and if
+  a section outlasts a timer period, ticks are lost (only one can be
+  pending). The serial console is the worst offender; see
+  :doc:`console_logging`.
+- **Waiters spin at full speed.** A core waiting on a lock does no other
+  work; a lock taken on a poll core stalls its RX processing for the
+  entire wait.
+- **False sharing.** A lock that shares a cache line with frequently
+  written data makes every lock operation bounce that line between
+  cores. Locks on contended paths should be cache-line aligned.
+
 
 Interrupt Safety
 ================
@@ -151,8 +177,9 @@ Non-Blocking & Diagnostics
 
    Attempts a single non-blocking acquire using atomic compare-and-swap
    (``lock cmpxchgw``). Returns ``true`` if successfully acquired, or
-   ``false`` if the lock was busy. Useful in non-blocking diagnostic paths
-   such as emergency serial panic logs.
+   ``false`` if the lock was busy. Currently used only by tests; the
+   panic path bypasses the console lock entirely instead (see
+   :doc:`console_logging`).
 
 .. c:function:: static inline bool spin_is_locked(spinlock_t *lock)
 
@@ -188,4 +215,5 @@ Related Files
 
 - ``include/spinlock.h``
 - ``include/types.h``
+- ``test/test_spinlock.c``
 

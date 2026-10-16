@@ -50,10 +50,12 @@ Boot Flow
       ├── enable_sse()                       CR0.EM/MP, CR4.OSFXSR/OSXMMEXCPT
       └── lgdt + far jmp ───────────▶ long_mode_start (64-bit)
                                       │                [entry64.asm]
+                                      ├── save MBI pointer (RD15)
                                       ├── load data segments
                                       ├── zero BSS
-                                      ├── set up kernel stack
+                                      ├── set up boot stack
                                       ├── jump to higher-half VMA
+                                      ├── relocate RSP to higher-half alias
                                       ├── convert MBI pointer to virtual
                                       └── call kernel_main(mbi)
 
@@ -92,6 +94,11 @@ The bootstrap code validates:
 2. The CPU supports the ``CPUID`` instruction (EFLAGS bit 21 toggle).
 3. Extended CPUID leaf ``0x8000_0001`` reports long mode support
    (EDX bit 29).
+
+The Multiboot2 header itself requests an 80x25 text-mode framebuffer.
+The tag is marked *optional*, so a loader without text-mode support
+(e.g., GRUB on UEFI) still boots the kernel; only the error stubs below
+lose their output.
 
 Any validation failure writes a two-character diagnostic to the VGA
 text buffer at ``0xB8000`` and halts:
@@ -192,32 +199,73 @@ Processors (see ``smp.rst``).
 Stage 4: 64-bit Runtime Initialization
 ======================================
 ``long_mode_start`` is the first code to execute in true 64-bit mode.
-It performs the minimum setup required before calling C:
+It resides in ``.text32`` (VMA == LMA) because the far jump's offset must
+be a physical address. It performs the minimum setup required before
+calling C:
 
-1. **Data segments** — loads the GDT data segment selector into
+1. **Save the MBI pointer** — ``mov r15d, edi``. Only EDI was written in
+   32-bit mode, and the upper half of every GPR is architecturally
+   undefined across the switch into 64-bit mode; the 32-bit move
+   zero-extends.
+
+2. **Data segments** — loads the GDT data segment selector into
    DS, ES, FS, GS, SS. CS was set by the far jump.
 
-2. **BSS clearing** — zeroes the region between ``__bss_start`` and
+3. **BSS clearing** — zeroes the region between ``__bss_start`` and
    ``__bss_end`` (linker-provided symbols, 8-byte aligned) using
    ``rep stosq``.
 
-3. **Stack** — sets RSP to ``stack_top`` (a 16 KiB region in BSS,
-   16-byte aligned).
+4. **Stack** — sets RSP to ``stack_top``: a 16 KiB region in its own
+   ``.boot_stack`` section (NOLOAD, VMA == LMA).
 
-4. **Higher-half jump** — executes ``lea rax, [rel .higher_half];
-   jmp rax`` to begin executing at the higher-half VMA. This works
-   because the label is linked at the high VMA and the RIP-relative
-   encoding resolves to the correct address.
+5. **Higher-half jump** — ``mov rax, higher_half_entry; jmp rax``. The
+   label is linked at its higher-half VMA, so the absolute 64-bit
+   immediate moves RIP into the higher half.
 
-5. **Multiboot2 pointer conversion** — adds ``KERNEL_VIRTUAL_BASE``
-   to the physical pointer (preserved in R15 across setup) to produce
-   a higher-half virtual address.
+6. **Stack relocation** — adds ``KERNEL_VIRTUAL_BASE`` to RSP, so the
+   stack is reached through its higher-half alias.
 
-6. **Stack alignment** — masks RSP to 16-byte alignment per the
+7. **Multiboot2 pointer conversion** — adds ``KERNEL_VIRTUAL_BASE``
+   to R15 to produce a higher-half virtual address in RDI.
+
+8. **Stack alignment** — masks RSP to 16-byte alignment per the
    System V AMD64 ABI.
 
-7. **Call** ``kernel_main(mbi)`` — the Multiboot2 info pointer is
+9. **Call** ``kernel_main(mbi)`` — the Multiboot2 info pointer is
    passed in RDI (first argument, System V AMD64 ABI).
+
+Physical Layout of the Boot Image
+=================================
+Starting at 1 MiB, the linker emits the boot sections in this order
+(all VMA = LMA), followed by the higher-half sections:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 50
+
+   * - Section
+     - Size
+     - Contents
+   * - ``.boot``
+     - < 4 KiB
+     - Multiboot2 header, 32-bit entry, ``long_mode_start``, boot GDT
+   * - ``.boot_page_tables``
+     - 12 KiB
+     - PML4, PDPT, PD (NOLOAD). **Still the live page tables**.
+   * - ``.boot_stack``
+     - 16 KiB
+     - BSP stack (NOLOAD)
+   * - ``.ap_trampoline``
+     - < 4 KiB
+     - AP startup code, copied to ``0x8000`` by ``smp_init()``
+   * - ``.text`` ... ``bss``
+     - —
+     - Higher-half kernel (VMA ``0xFFFF_FFFF_8000_0000`` + physical)
+
+The linker script also places the linker-synthesized dynamic sections
+(``.got``, ``.plt``, ``.rela.*``) and asserts that they are empty, and
+the build links with ``--orphan-handling=error`` so that any section the
+script does not name fails the link instead of being placed arbitrarily.
 
 
 Postconditions
@@ -232,11 +280,11 @@ When ``kernel_main()`` begins executing, the following invariants hold:
 - Execution is in the higher-half address space.
 - RDI contains a higher-half pointer to the Multiboot2 info structure.
 - Interrupts are disabled (IF = 0).
+- CR3 points at the boot PML4, which the rest of the kernel keeps using.
 
 
 Multiboot2 Information Structure
 ================================
-
 The Multiboot2 information structure is a variable-length sequence of
 8-byte-aligned tags, terminated by a tag of type 0 (end). The kernel
 parses it via ``multiboot2_get_tag()`` (defined in ``multiboot2.h``).
@@ -261,10 +309,10 @@ parses it via ``multiboot2_get_tag()`` (defined in ``multiboot2.h``).
      - PMM initialisation
    * - 9
      - ELF sections
-     - Future use
+     - Not consumed
    * - 14/15
      - ACPI RSDP / XSDP
-     - Future use
+     - Not consumed yet — required for real hardware.
 
 
 References
@@ -289,4 +337,5 @@ Related Files
 - ``boot/entry64.asm``
 - ``kernel/linker.ld``
 - ``include/multiboot2.h``
+- ``include/kernel.h``
 
