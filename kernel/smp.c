@@ -253,7 +253,8 @@ NORETURN void ap_entry(void)
 
     // Install per-core TSS and load the Task Register
     if (my_core >= 0)
-        tss_init_ap(my_core);
+        tss_init_ap(my_core,
+                    (uint64_t)cores[my_core].stack_base + AP_STACK_SIZE);
 
     // Set up the per-CPU area (sets GS base)
     if (my_core >= 0)
