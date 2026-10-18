@@ -153,8 +153,10 @@ void tss_init(void)
     runtime_gdt[2] = gdt64[2];  // 64-bit data
 
     // Set up the BSP's TSS (core 0)
-    extern char stack_top[];  // from entry64.asm
-    setup_core_tss(0, (uint64_t)stack_top);
+    // stack_top (entry64.asm) is a physical-address symbol; the BSP runs
+    // on its higher-half alias
+    extern char stack_top[];
+    setup_core_tss(0, (uint64_t)stack_top + KERNEL_VIRTUAL_BASE);
 
     // Build and load the new GDT
     int total_slots = GDT_BASE_ENTRIES + SMP_MAX_CORES * GDT_TSS_SLOTS;
@@ -190,16 +192,14 @@ void tss_init(void)
             (void *)per_core_tss[0].ist2);
 }
 
-void tss_init_ap(int core_index)
+void tss_init_ap(int core_index, uint64_t stack_top)
 {
     if (core_index < 0 || core_index >= SMP_MAX_CORES)
         return;
 
-    // The AP's kernel stack top was allocated by smp.c
-    // extern struct core_info *smp_get_core(int index);
-    struct core_info *ci = smp_get_core(core_index);
-    uint64_t stack_top = (uint64_t)ci->stack_base + AP_STACK_SIZE;
-
+    // The stack is passed in rather than looked up via smp_get_core():
+    // a starting AP is not yet counted in core_count, so that lookup
+    // returns NULL here.
     setup_core_tss(core_index, stack_top);
 
     // Load the runtime GDT - the AP is still using the boot GDT
