@@ -16,14 +16,16 @@
  * - @b empty   : all objects free (returned to PMM by
  *                  @c slab_cache_shrink)
  *
- * Cache metadata is heap-allocated (via @c kzalloc). Slab pages are
- * PMM-allocated and accessed through the higher-half direct mapping.
+ * Cache metadata is heap-allocated (cache-line aligned). Slab pages are
+ * PMM-allocated, physically contiguous, and accessed through the direct
+ * map — so slab objects are valid DMA buffers and @c VIRT_TO_PHYS works
+ * on them.
  *
- * @note This relies on all PMM-allocated pages being accessible via
- *       @c PHYS_TO_VIRT(), which is true as long as the PMM is limited
- *       to the first 1 GiB (covered by the boot-time mapping). If
- *       @c PMM_MAX_MEMORY is increased, slabs must be explicitly mapped
- *       via the VMM.
+ * @par Object alignment
+ * Objects of 64 bytes or more are cache-line aligned, so no object
+ * straddles a line it doesn't need to (and two cores working on
+ * neighboring objects never share a line). Smaller objects are 16-byte
+ * aligned.
  */
 
 #include "slab.h"
@@ -67,11 +69,22 @@ struct slab
  */
 #define SLAB_MAGAZINE_SIZE  32
 
+/**
+ * Cache-line aligned: each core writes only its own magazine, and without
+ * the alignment one core's @c count would share a line with its
+ * neighbor's @c objects — every alloc/free would bounce that line between
+ * the two cores.
+ *
+ *  @warning The fast path is not interrupt-safe: an interrupt handler on
+ *           the same core that allocates or frees from the same cache can
+ *           corrupt the magazine. Allocation from interrupt context is
+ *           not supported.
+ */
 struct slab_magazine
 {
     void *objects[SLAB_MAGAZINE_SIZE];
     int   count;                  ///< Number of objects in the magazine.
-};
+} CACHE_ALIGNED;
 /// @}
 
 /// All metadata for a single object-size class.
@@ -142,8 +155,9 @@ static void cache_calculate(struct slab_cache *cache)
     if (cache->obj_size < MIN_OBJ_SIZE)
         cache->obj_size = MIN_OBJ_SIZE;
 
-    // Apply alignment
-    cache->obj_align = SLAB_MIN_ALIGN;
+    // Apply alignment: whole cache lines for objects of a line or more
+    cache->obj_align = (cache->obj_size >= CACHE_LINE_SIZE)
+                     ? CACHE_LINE_SIZE : SLAB_MIN_ALIGN;
     cache->obj_size = ALIGN_UP(cache->obj_size, cache->obj_align);
 
     // Select slab size: target ~32 objects, minimum 1 page, max 8 pages
@@ -275,19 +289,18 @@ void slab_init(void)
 struct slab_cache *slab_cache_create(const char *name, size_t obj_size,
                                      uint32_t flags)
 {
-    struct slab_cache *cache = kzalloc(sizeof(struct slab_cache));
+    // Cache-aligned so the per-core magazines' alignment holds
+    struct slab_cache *cache = kaligned_alloc(sizeof(struct slab_cache),
+                                              CACHE_LINE_SIZE);
     if (!cache)
         return NULL;
+    memset(cache, 0, sizeof(*cache));
 
     strlcpy(cache->name, name, SLAB_NAME_MAX);
     cache->requested_size = obj_size;
     cache->obj_size       = obj_size;
     cache->flags          = flags;
     cache->lock           = (spinlock_t)SPINLOCK_INIT;
-
-    // Zero all per-core magazines (kzalloc already zeroed, but be explicit)
-    for (int i = 0; i < SMP_MAX_CORES; ++i)
-        cache->magazines[i].count = 0;
 
     cache_calculate(cache);
 

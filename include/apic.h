@@ -49,12 +49,6 @@
 #define APIC_BASE_ADDR_MASK  0x000FFFFFFFFFF000ULL
 /// @}
 
-/// @name Fallback virtual addresses
-/// @{
-#define LAPIC_FALLBACK_VADDR   0xFFFFFFFFFFE00000ULL
-#define IOAPIC_FALLBACK_VADDR  0xFFFFFFFFFFE01000ULL
-/// @}
-
 /// @name Local APIC default base address
 /// @{
 

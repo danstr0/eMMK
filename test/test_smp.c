@@ -73,6 +73,18 @@ uint32_t test_smp(void)
     // ── AP verification ─────────────────────────────────
     {
         int count = smp_get_core_count();
+        
+        uint32_t eax, ebx, ecx, edx;
+        __asm__ volatile("cpuid"
+                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                         : "a"(1));
+        int expected = (ebx >> 16) & 0xFF;
+        if (expected < 1)
+            expected = 1;
+        if (expected > SMP_MAX_CORES)
+            expected = SMP_MAX_CORES;
+        TEST_ASSERT_EQ(count, expected, "all CPUs reported by CPUID online");
+
         for (int i = 1; i < count; ++i)
         {
             struct core_info *ci = smp_get_core(i);

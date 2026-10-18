@@ -20,8 +20,8 @@
 ;;;   0xFFFF_FFFF_8000_0000 .. 0xFFFF_FFFF_BFFF_FFFF  Higher-half (1 GiB)
 ;;; @endcode
 ;;;
-;;; Both ranges point to physical @c 0x0 .. @c 0x3FFF_FFFF, covering the kernel
-;;; image and common MMIO regions (e.g., VGA text buffer at @c 0xB8000).
+;;; Both ranges point to physical @c 0x0 .. @c 0x3FFF_FFFF, covering the
+;;; kernel image and common MMIO regions (e.g., VGA text buffer at @c 0xB8000).
 ;;;
 ;;; @note All 32-bit code and data reside in @c .text32 / @c .rodata32, which
 ;;;       the linker script places at VMA == LMA (physical addresses). GRUB
@@ -223,8 +223,13 @@ PAGE_HUGE     equ (1 << 7)
 ;;; - @c 0x0000_0000_0000_0000 -> physical 0x0 (identity)
 ;;; - @c 0xFFFF_FFFF_8000_0000 -> physical 0x0 (higher-half / kernel)
 ;;;
-;;; TODO: On real hardware, either load the kernel at >= 2 MiB or map the
-;;;       first 2 MiB with 4 KiB pages.
+;;; @note The first 2 MiB page covers both the kernel image (loaded at
+;;;       1 MiB) and the legacy region below 1 MiB, whose fixed-range MTRRs
+;;;       mark parts uncacheable. A large page spanning several MTRR memory
+;;;       types may be treated as UC in its entirety. These tables only
+;;;       live until @c vmm_init(), whose replacement tables map everything
+;;;       below 2 MiB with 4 KiB pages, so at worst early boot runs slowly
+;;;       on real hardware.
 ;;;
 setup_page_tables:
     ;; Zero all three page tables (3 * 4096 bytes)

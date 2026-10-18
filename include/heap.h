@@ -2,18 +2,23 @@
  * @file heap.h
  * @brief General-purpose kernel heap allocator.
  *
- * Provides @c kmalloc / <code>kfree</code>-style dynamic memory allocation
+ * Provides @c kmalloc / `kfree`-style dynamic memory allocation
  * for kernel use. Internally uses a linked-list free list with first-fit 
  * allocation and block coalescing on free.
  *
  * @par Alignment guarantee
  * All allocations are aligned to at least @c HEAP_ALIGNMENT bytes (16),
- * satisfying x86-64 ABI requirements and SSE operand alignment.
+ * satisfying x86-64 ABI requirements and SSE operand alignment. Use
+ * @c kalligned_alloc() for anything stricter (e.g., 64-byte cache lines).
  *
  * @par Backing memory
- * The heap obtains physical pages from the PMM and maps them via the VMM.
- * It starts at @c HEAP_INITIAL_SIZE and grows on demand up to
- * @c HEAP_MAX_SIZE.
+ * The heap resides at @c HEAP_VIRTUAL_BASE. It obtains physical pages
+ * from the PMM one at a time and maps them via the VMM, starting at
+ * @c HEAP_INITIAL_SIZE and growing on demand up to @c HEAP_MAX_SIZE.
+ *
+ * @warning Heap memory is not physically contiguous and is not in the
+ *          direct map: never pass it to a device for DMA, and never use
+ *          @c VIRT_TO_PHYS on it. DMA buffers come from the PMM / slab.
  */
 
 #ifndef EMMK_HEAP_H
@@ -117,6 +122,7 @@ void *krealloc(void *ptr, size_t new_size);
  * @note Pointers returned by this function must be freed with @c kfree()
  *       like any other allocation. The allocator stores alignment
  *       metadata that @c kfree() uses to locate the underlying block.
+ *       They must @b not be passed to @c krealloc().
  */
 void *kaligned_alloc(size_t size, size_t alignment);
 /// @}

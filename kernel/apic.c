@@ -257,22 +257,14 @@ void lapic_init(void)
         kprintf("[APIC] Enabled via MSR\n");
     }
 
-    // Map the APIC register page
-    if (base_phys < (1ULL * 1024 * 1024 * 1024))
-        lapic_base = (volatile uint32_t *)PHYS_TO_VIRT(base_phys);
-    else
+    // Map the APIC register page (uncached). All cores share the same
+    // physical address and therefore this one mapping.
+    lapic_base = (volatile uint32_t *)vmm_map_mmio(base_phys, PAGE_SIZE);
+    if (!lapic_base)
     {
-        // APIC is above the boot mapping - create an explicit MMIO
-        // mapping at a fixed virtual address in the kernel's reserved
-        // range.
-        uint64_t vaddr = LAPIC_FALLBACK_VADDR;
-        if (vmm_map_page(vaddr, base_phys, PTE_MMIO) != VMM_OK)
-        {
-            kprintf("[APIC] ERROR: Failed to map APIC registers "
-                    "at phys 0x%lx\n", base_phys);
-            return;
-        }
-        lapic_base = (volatile uint32_t *)vaddr;
+        kprintf("[APIC] ERROR: Failed to map APIC registers "
+                "at phys 0x%lx\n", base_phys);
+        return;
     }
 
     kprintf("[APIC] Base: phys 0x%lx, virt %p%s\n",
@@ -359,18 +351,12 @@ void ioapic_init(uint64_t base_phys)
 {
     kprintf("[IOAPIC] Initializing at phys 0x%lx...\n", base_phys);
 
-    // Map the I/O APIC register window
-    if (base_phys < (1ULL * 1024 * 1024 * 1024))
-        ioapic_base = (volatile uint32_t *)PHYS_TO_VIRT(base_phys);
-    else
+    // Map the I/O APIC register window (uncached)
+    ioapic_base = (volatile uint32_t *)vmm_map_mmio(base_phys, PAGE_SIZE);
+    if (!ioapic_base)
     {
-        uint64_t vaddr = IOAPIC_FALLBACK_VADDR;
-        if (vmm_map_page(vaddr, base_phys, PTE_MMIO) != VMM_OK)
-        {
-            kprintf("[IOAPIC] ERROR: Failed to map I/O APIC registers\n");
-            return;
-        }
-        ioapic_base = (volatile uint32_t *)vaddr;
+        kprintf("[IOAPIC] ERROR: Failed to map I/O APIC registers\n");
+        return;
     }
 
     // Read I/O APIC identification and capabilities

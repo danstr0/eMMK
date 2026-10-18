@@ -123,10 +123,10 @@ void tss_init(void);
  * descriptor, and loads TR.
  *
  * @param core_index  The core's index (@c 1 .. @c core_count-1).
+ * @param stack_top   Top of the AP's kernel stack (becomes RSP0).
  */
-void tss_init_ap(int core_index);
+void tss_init_ap(int core_index, uint64_t stack_top);
 /// @}
-
 
 /// @name Per-core TSS access
 /// @{

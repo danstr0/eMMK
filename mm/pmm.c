@@ -7,19 +7,20 @@
  * - bit = 0 → free
  *
  * @par Initialization strategy
- * 1. Scan the Multiboot2 memory map to find the highest usable address.
- * 2. Place the bitmap immediately after the kernel image in physical memory.
+ * 1. Record the RAM regions of the Multiboot2 memory map (for the VMM's
+ *    direct map) and find the highest available address.
+ * 2. Place the bitmap in free RAM below 1 GiB (reachable through the boot
+ *    page tables), avoiding the kernel image and the Multiboot2 info.
  * 3. Mark all pages as used (all bits set).
  * 4. Clear bits for regions the memory map reports as available.
- * 5. Re-mark the kernel image, bitmap, and low memory as reserved.
+ * 5. Re-reserve the low 1 MiB, the kernel image, the Multiboot2 info, and
+ *    the bitmap.
  *
  * Allocation uses a rotor (@c pmm_last_alloc) to avoid always scanning
- * from the beginning, providing roughly O(n/64) amortised allocation in 
+ * from the beginning, providing roughly O(n/64) amortised allocation in
  * the common case.
  *
- * The critical sections of @c pmm_alloc_page(), @c pmm_alloc_pages(),
- * @c pmm_alloc_aligned(), and @c pmm_free_pages() are wrapped with a
- * spinlock @c pmm_lock.
+ * All bitmap state is protected by @c pmm_lock.
  */
 
 #include "pmm.h"
@@ -28,32 +29,20 @@
 #include "string.h"
 #include "spinlock.h"
 
-// ── Linker symbols & configuration ─────────────────────────────────────
+// ── Linker symbols ─────────────────────────────────────────────────────
 
 /**
- * Maximum physical memory to manage (bytes).
- * 
- * Limited to 1 GiB to match the identity/higher-half mapping established
- * in multiboot2.asm. Increase this when the VMM supports additional page
- * table mappings.
+ * The linker script defines these as raw physical values. When accessed
+ * from C, the symbol's "address" is its value, so
+ * @c (uintptr_t)_kernel_physical_end yields the physical address
+ * numerically.
  */
-#define PMM_MAX_MEMORY  (1ULL * 1024 * 1024 * 1024)
-
-/**
- * @c _kernel_physical_end is defined in the linker script as a raw
- * physical value. When accessed from C, the compiler treats the symbol's
- * "address" as its value, so @c (uintptr_t)_kernel_physical_end yields
- * the physical address numerically — no @c VIRT_TO_PHYS conversion needed.
- */
+extern char _kernel_physical_start[];
 extern char _kernel_physical_end[];
-
-// ── Forward declarations ───────────────────────────────────────────────
-
-void pmm_free_pages(uint64_t paddr, size_t count);
 
 // ── Bitmap state ───────────────────────────────────────────────────────
 
-/// Pointer to the bitmap (virtual address, within the higher-half map).
+/// Pointer to the bitmap (boot alias until the direct map is enabled).
 static uint64_t *pmm_bitmap;
 
 /// Size of the bitmap in bytes (page-aligned).
@@ -71,13 +60,19 @@ static uint64_t pmm_free_count;
 /// PFN of the last successful allocation (rotor for fast scanning).
 static uint64_t pmm_last_alloc;
 
+/// Set by @c pmm_enable_direct_map().
+static bool pmm_direct_map;
+
+/// RAM regions recorded from the memory map (see `struct pmm_region`).
+static struct pmm_region pmm_regions[PMM_MAX_REGIONS];
+static size_t            pmm_num_regions;
+
 /**
  * Protects all bitmap state (bitmap, free_count, last_alloc).
  *
- * For now contention is low — the PMM is called primarily during
- * init, heap expansion, and large-buffer allocation. The hot-path
- * allocations go through the slab layer, which is per-core and
- * lock-free.
+ * Contention is low: the PMM is called during init, heap expansion, and
+ * slab growth. The per-packet allocation paths go through the slab
+ * layer's per-core magazines and never reach the PMM in steady state.
  */
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
@@ -93,30 +88,129 @@ static spinlock_t pmm_lock = SPINLOCK_INIT;
 /// Mark a page frame as allocated (set bit).
 static inline void bitmap_set(uint64_t pfn)
 {
-    pmm_bitmap[WORD_INDEX(pfn)] |= (1ULL << BIT_INDEX(pfn));
+    pmm_bitmap[WORD_INDEX(pfn)] |= (1UL << BIT_INDEX(pfn));
 }
 
 /// Mark a page frame as free (clear bit).
 static inline void bitmap_clear(uint64_t pfn)
 {
-    pmm_bitmap[WORD_INDEX(pfn)] &= ~(1ULL << BIT_INDEX(pfn));
+    pmm_bitmap[WORD_INDEX(pfn)] &= ~(1UL << BIT_INDEX(pfn));
 }
 
 /// Test whether a page frame is allocated (bit is set).
 static inline bool bitmap_test(uint64_t pfn)
 {
-    return (pmm_bitmap[WORD_INDEX(pfn)] & (1ULL << BIT_INDEX(pfn))) != 0;
+    return (pmm_bitmap[WORD_INDEX(pfn)] & (1UL << BIT_INDEX(pfn))) != 0;
+}
+
+/// Mark a range used. Caller holds @c pmm_lock (or is single-threaded init).
+static void mark_used_locked(uint64_t start, uint64_t end)
+{
+    for (uint64_t addr = PAGE_ALIGN_DOWN(start);
+        addr < PAGE_ALIGN_UP(end);
+        addr += PAGE_SIZE)
+    {
+        uint64_t pfn = ADDR_TO_PFN(addr);
+        if (pfn < pmm_total_pages && !bitmap_test(pfn))
+        {
+            bitmap_set(pfn);
+            pmm_free_count--;
+        }
+    }
+}
+
+// ── Initialization helpers ─────────────────────────────────────────────
+
+/// True if [a0, a1) and [b0, b1) overlap.
+static inline bool ranges_overlap(uint64_t a0, uint64_t a1,
+                                  uint64_t b0, uint64_t b1)
+{
+    return a0 < b1 && b0 < a1;
+}
+
+/**
+ * @brief Find a home for the bitmap.
+ *
+ * The bitmap must lie entirely inside an available region, below the
+ * boot mapping limit (it is written before the direct map exists), and
+ * must not overlap the kernel image or the Multiboot2 info structure.
+ *
+ * @return Physical start address, or 0 if no region fits.
+ */
+static uint64_t place_bitmap(struct multiboot2_tag_mmap *mmap, uint64_t size,
+                             uint64_t kern_start, uint64_t kern_end,
+                             uint64_t mbi_start, uint64_t mbi_end)
+{
+    struct multiboot2_mmap_entry *entry;
+    multiboot2_mmap_foreach(mmap, entry)
+    {
+        if (entry->type != MULTIBOOT2_MEMORY_AVAILABLE)
+            continue;
+
+        uint64_t start = PAGE_ALIGN_UP(MAX(entry->addr, 0x100000UL));
+        uint64_t end   = PAGE_ALIGN_DOWN(MIN(entry->addr + entry->len,
+                                             BOOT_MAP_LIMIT));
+
+        // Slide past the kernel and the MBI until the candidate overlaps
+        // neither
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            if (ranges_overlap(start, start + size, kern_start, kern_end))
+                start = PAGE_ALIGN_UP(kern_end);
+            if (ranges_overlap(start, start + size, mbi_start, mbi_end))
+                start = PAGE_ALIGN_UP(mbi_end);
+        }
+
+        if (start + size <= end)
+            return start;
+    }
+    return 0;
+}
+
+/// Record the RAM-type memory-map entries for the direct map.
+static void record_regions(struct multiboot2_tag_mmap *mmap)
+{
+    struct multiboot2_mmap_entry *entry;
+    pmm_num_regions = 0;
+
+    multiboot2_mmap_foreach(mmap, entry)
+    {
+        if (entry->type != MULTIBOOT2_MEMORY_AVAILABLE
+            && entry->type != MULTIBOOT2_MEMORY_ACPI_RECLAIMABLE
+            && entry->type != MULTIBOOT2_MEMORY_NVS)
+            continue;
+
+        if (entry->len == 0 || entry->addr >= PMM_MAX_MEMORY)
+            continue;
+
+        if (pmm_num_regions == PMM_MAX_REGIONS)
+        {
+            kprintf("[PMM] WARNING: more than %u RAM regions; "
+                    "ignoring the rest\n", PMM_MAX_REGIONS);
+            break;
+        }
+
+        struct pmm_region *r = &pmm_regions[pmm_num_regions++];
+        r->start = entry->addr;
+        r->end   = MIN(entry->addr + entry->len, PMM_MAX_MEMORY);
+        r->type  = entry->type;
+    }
 }
 
 // ── Initialization ─────────────────────────────────────────────────────
 
-void pmm_init(struct multiboot2_tag_mmap *mmap, uint64_t mb_info_end)
+void pmm_init(struct multiboot2_tag_mmap *mmap,
+              uint64_t mbi_start, uint64_t mbi_end)
 {
     struct multiboot2_mmap_entry *entry;
     uint64_t max_addr = 0;
-    uint64_t kernel_end_phys;
 
-    // 1. Find the highest usable physical address
+    uint64_t kern_start = PAGE_ALIGN_DOWN((uintptr_t)_kernel_physical_start);
+    uint64_t kern_end   = PAGE_ALIGN_UP((uintptr_t)_kernel_physical_end);
+
+    record_regions(mmap);
+
+    // 1. Find the highest available physical address
     multiboot2_mmap_foreach(mmap, entry)
     {
         if (entry->type == MULTIBOOT2_MEMORY_AVAILABLE)
@@ -128,24 +222,33 @@ void pmm_init(struct multiboot2_tag_mmap *mmap, uint64_t mb_info_end)
     }
 
     if (max_addr > PMM_MAX_MEMORY)
+    {
+        kprintf("[PMM] WARNING: RAM above %lu GiB ignored\n",
+                PMM_MAX_MEMORY >> 30);
         max_addr = PMM_MAX_MEMORY;
+    }
 
-    // 2. Calculate bitmap dimensions
+    // 2. Calculate bitmap dimensions and place it
     pmm_total_pages = max_addr / PAGE_SIZE;
     pmm_bitmap_size = PAGE_ALIGN_UP((pmm_total_pages + 7) / 8);
 
-    // 3. Place bitmap immediately after mb_info or the kernel image
-    kernel_end_phys = PAGE_ALIGN_UP((uintptr_t)_kernel_physical_end);
-    uint64_t bitmap_start = kernel_end_phys;
-    if (mb_info_end > bitmap_start)
-        bitmap_start = PAGE_ALIGN_UP(mb_info_end);
-    pmm_bitmap = (uint64_t *)PHYS_TO_VIRT(bitmap_start);
+    pmm_bitmap_phys = place_bitmap(mmap, pmm_bitmap_size,
+                                   kern_start, kern_end,
+                                   mbi_start, mbi_end);
+    if (pmm_bitmap_phys == 0)
+    {
+        kprintf("[PMM] FATAL: no room for a %lu KiB bitmap below 1 GiB\n",
+                pmm_bitmap_size / 1024);
+        for (;;)
+            __asm__ volatile("cli; hlt");
+    }
+    pmm_bitmap = (uint64_t *)BOOT_PHYS_TO_VIRT(pmm_bitmap_phys);
 
-    // 4. Mark every page as used (all bits set)
+    // 3. Mark every page as used (all bits set)
     memset(pmm_bitmap, 0xFF, pmm_bitmap_size);
     pmm_free_count = 0;
 
-    // 5. Free pages in regions the memory map reports as available
+    // 4. Free pages in regions the memory map reports as available
     multiboot2_mmap_foreach(mmap, entry)
     {
         if (entry->type == MULTIBOOT2_MEMORY_AVAILABLE)
@@ -153,35 +256,54 @@ void pmm_init(struct multiboot2_tag_mmap *mmap, uint64_t mb_info_end)
             uint64_t start = PAGE_ALIGN_UP(entry->addr);
             uint64_t end   = PAGE_ALIGN_DOWN(entry->addr + entry->len);
 
-            if (start >= PMM_MAX_MEMORY)
+            if (start >= max_addr)
                 continue;
-            if (end > PMM_MAX_MEMORY)
-                end = PMM_MAX_MEMORY;
+            if (end > max_addr)
+                end = max_addr;
 
             for (uint64_t addr = start; addr < end; addr += PAGE_SIZE)
             {
-                bitmap_clear(ADDR_TO_PFN(addr));
-                pmm_free_count++;
+                uint64_t pfn = ADDR_TO_PFN(addr);
+                if (bitmap_test(pfn))  // regions may overlap
+                {
+                    bitmap_clear(pfn);
+                    pmm_free_count++;
+                }
             }
         }
     }
 
-    // 6. Re-reserve vital regions that overlap "available" memory:
-    //      - Low 1 MiB: real-mode IVT, BDA, EBDA, BIOS ROM
-    //      - Kernel image, multiboot2 info, bitmap
-    pmm_bitmap_phys = bitmap_start;
-
-    pmm_mark_used(0, 0x100000);
-    pmm_mark_used(0x100000, pmm_bitmap_phys + pmm_bitmap_size);
+    // 5. Re-reserve vital regions that overlap "available" memory
+    //      - Low 1 MiB: real-mode IVT, BDA, EBDA, BIOS ROM, AP trampoline
+    //      - Kernel image (incl. boot page tables and boot stack)
+    //      - Multiboot2 info structure
+    //      - The bitmap itself
+    mark_used_locked(0, 0x100000);
+    mark_used_locked(kern_start, kern_end);
+    mark_used_locked(mbi_start, mbi_end);
+    mark_used_locked(pmm_bitmap_phys, pmm_bitmap_phys + pmm_bitmap_size);
 
     pmm_last_alloc = 0;
 
     kprintf("[PMM] Bitmap at phys 0x%lx, %lu bytes (%lu words)\n",
-            kernel_end_phys, pmm_bitmap_size, BITMAP_NUM_WORDS);
-    kprintf("[PMM] %lu / %lu pages free (%lu MiB / %lu MiB)\n",
+            pmm_bitmap_phys, pmm_bitmap_size, BITMAP_NUM_WORDS);
+    kprintf("[PMM] %lu / %lu pages free (%lu MiB / %lu MiB), "
+            "%zu RAM regions\n",
             pmm_free_count, pmm_total_pages,
             (pmm_free_count * PAGE_SIZE) / (1024 * 1024),
-            (pmm_total_pages * PAGE_SIZE) / (1024 * 1024));
+            (pmm_total_pages * PAGE_SIZE) / (1024 * 1024),
+            pmm_num_regions);
+}
+
+void pmm_enable_direct_map(void)
+{
+    pmm_bitmap     = (uint64_t *)PHYS_TO_VIRT(pmm_bitmap_phys);
+    pmm_direct_map = true;
+}
+
+void *pmm_phys_to_virt(uint64_t paddr)
+{
+    return pmm_direct_map ? PHYS_TO_VIRT(paddr) : BOOT_PHYS_TO_VIRT(paddr);
 }
 
 // ── Single page allocation ─────────────────────────────────────────────
@@ -200,11 +322,11 @@ uint64_t pmm_alloc_page(void)
         uint64_t word = pmm_bitmap[idx];
 
         // Skip fully-allocated words
-        if (word == ~0ULL)
+        if (word == ~0UL)
             continue;
 
         // Find the first free bit in this word
-        int bit = __builtin_ctzll(~word);
+        int bit = __builtin_ctzl(~word);
         uint64_t pfn = (idx * BITS_PER_WORD) + bit;
 
         if (pfn < pmm_total_pages)
@@ -248,6 +370,15 @@ uint64_t pmm_alloc_pages(size_t count)
         if (pfn == 0 && i != 0)
             run_len = 0;
 
+        // Outside a run, skip whole fully-allocated words at once
+        if (run_len == 0 && BIT_INDEX(pfn) == 0
+            && pfn + BITS_PER_WORD <= pmm_total_pages
+            && pmm_bitmap[WORD_INDEX(pfn)]== ~0UL)
+        {
+            i += BITS_PER_WORD - 1;
+            continue;
+        }
+
         if (!bitmap_test(pfn))
         {
             if (run_len == 0)
@@ -269,8 +400,8 @@ uint64_t pmm_alloc_pages(size_t count)
     }
 
     spin_unlock_irqrestore(&pmm_lock, flags);
-    kprintf("[PMM] WARNING: Failed to allocate %lu contiguous pages\n",
-            (uint64_t)count);
+    kprintf("[PMM] WARNING: Failed to allocate %zu contiguous pages\n",
+            count);
     return PMM_ALLOC_FAILED;
 }
 
@@ -310,8 +441,8 @@ uint64_t pmm_alloc_aligned(size_t count, size_t align_pages)
     }
 
     spin_unlock_irqrestore(&pmm_lock, flags);
-    kprintf("[PMM] WARNING: Failed to allocate %lu aligned pages"
-            " (align=%lu)\n", (uint64_t)count, (uint64_t)align_pages);
+    kprintf("[PMM] WARNING: Failed to allocate %zu aligned pages"
+            " (align=%zu)\n", count, align_pages);
     return PMM_ALLOC_FAILED;
 }
 
@@ -320,8 +451,19 @@ uint64_t pmm_alloc_aligned(size_t count, size_t align_pages)
 uint64_t pmm_alloc_page_zero(void)
 {
     uint64_t paddr = pmm_alloc_page();
-    if (paddr != PMM_ALLOC_FAILED)
-        memset(PHYS_TO_VIRT(paddr), 0, PAGE_SIZE);
+    if (paddr == PMM_ALLOC_FAILED)
+        return paddr;
+
+    if (!pmm_direct_map && paddr >= BOOT_MAP_LIMIT)
+    {
+        // Not reachable through the boot mapping yet
+        kprintf("[PMM] ERROR: early zeroed page 0x%lx above boot map\n",
+                paddr);
+        pmm_free_page(paddr);
+        return PMM_ALLOC_FAILED;
+    }
+
+    memset(pmm_phys_to_virt(paddr), 0, PAGE_SIZE);
     return paddr;
 }
 
@@ -365,21 +507,17 @@ void pmm_free_pages(uint64_t paddr, size_t count)
 
 void pmm_mark_used(uint64_t start, uint64_t end)
 {
-    for (uint64_t addr = PAGE_ALIGN_DOWN(start);
-         addr < PAGE_ALIGN_UP(end);
-         addr += PAGE_SIZE)
-    {
-        uint64_t pfn = ADDR_TO_PFN(addr);
-        if (pfn < pmm_total_pages && !bitmap_test(pfn))
-        {
-            bitmap_set(pfn);
-            pmm_free_count--;
-        }
-    }
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+    mark_used_locked(start, end);
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 void pmm_mark_free(uint64_t start, uint64_t end)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+
     for (uint64_t addr = PAGE_ALIGN_UP(start);
          addr < PAGE_ALIGN_DOWN(end);
          addr += PAGE_SIZE)
@@ -391,6 +529,8 @@ void pmm_mark_free(uint64_t start, uint64_t end)
             pmm_free_count++;
         }
     }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 // ── Queries ────────────────────────────────────────────────────────────
@@ -401,7 +541,6 @@ bool pmm_is_free(uint64_t paddr)
     if (pfn >= pmm_total_pages)
         return false;
     return !bitmap_test(pfn);
-
 }
 
 void pmm_get_stats(struct pmm_stats *stats)
@@ -415,5 +554,15 @@ void pmm_get_stats(struct pmm_stats *stats)
     stats->total_memory   = pmm_total_pages * PAGE_SIZE;
     stats->free_memory    = pmm_free_count * PAGE_SIZE;
     stats->max_physical_addr = PFN_TO_ADDR(pmm_total_pages);
+}
+
+size_t pmm_region_count(void)
+{
+    return pmm_num_regions;
+}
+
+const struct pmm_region *pmm_get_region(size_t index)
+{
+    return index < pmm_num_regions ? &pmm_regions[index] : NULL;
 }
 

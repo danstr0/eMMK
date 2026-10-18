@@ -4,7 +4,6 @@ Slab Allocator
 
 Overview
 ========
-
 eMMK's Slab Allocator manages caches of uniform-sized objects. By
 pre-allocating contiguous physical pages from the PMM and carving them
 into fixed slots, it provides ``O(1)`` allocation and deallocation while
@@ -60,6 +59,33 @@ Design Principles
 - **Per-CPU Concurrency Scaling:** Allocation and deallocation hit local
   magazines first. Spinlock contention on ``cache->lock`` only occurs
   during batch refills or drains.
+- **No false sharing between magazines:** each ``struct slab_magazine``
+  is cache-line aligned (and the cache descriptor is allocated 64-byte
+  aligned so the alignment holds).
+- **Cache-line aligned objects:** objects of 64 bytes or more are
+  64-byte aligned (smaller ones 16-byte). A 112-byte ``struct netbuf``
+  therefore occupies 128 bytes and never straddles an extra line.
+- **DMA-safe:** slabs are physically contiguous PMM pages accessed
+  through the direct map, so ``VIRT_TO_PHYS`` works on slab objects and
+  they can be handed to devices.
+
+
+Constraints
+===========
+- **Not interrupt-safe:** The magazine fast path does not disable
+  interrupts. An interrupt handler that allocates or frees from a cache
+  on the same core can corrupt that core's magazine. Allocation from
+  interrupt context is not supported (eMMK's data path is polled).
+- **Core identification cost:** The fast path calls ``smp_core_id()``,
+  which currently executes ``rdmsr`` (tens of cycles, serializing) on
+  every call. To be replaced with a single ``%gs``-relative load.
+- **Cross-core producer/consumer:** When one core allocates and another
+  frees (e.g., the demo's distributor and workers), the allocating core's
+  magazine empties and the freeing core's overflows, so both hit
+  ``cache->lock`` once every ``SLAB_MAGAZINE_SIZE / 2`` operations.
+- ``slab_cache_destroy`` / ``slab_cache_drain_magazines`` drain other
+  cores' magazines; those cores must not be using the cache meanwhile.
+
 
 Cache Types
 ===========
@@ -81,13 +107,13 @@ prevent cross-subsystem starvation and enable fine-grained diagnostics.
 
 Generic Size Classes
 --------------------
-
 During ``slab_init()``, nine generic power-of-two caches (16 B to 4096 B)
 are created. The helper ``slab_alloc_size()`` routes requests to these
 caches:
 
 - Sizes **<= 4096 bytes** are serviced by the corresponding slab size class.
 - Sizes **> 4096 bytes** fall back to ``kmalloc()``.
+
 
 Configuration Flags
 ===================
@@ -109,6 +135,7 @@ Configuration Flags
    * - ``SLAB_RECLAIM``
      - Identifies caches eligible for automated shrinking under memory
        pressure.
+
 
 API Reference
 =============
@@ -143,9 +170,9 @@ API Reference
      - Dumps active object counts, effective object sizes, and page usage
        to serial log.
 
+
 Memory Reclamation & Synchronization
 ====================================
-
 When system physical memory is constrained, ``slab_cache_shrink()``
 reclaims unused page frames.
 
@@ -155,6 +182,7 @@ reclaims unused page frames.
    ``slab_cache_drain_magazines(cache)`` prior to ``slab_cache_shrink(cache)``
    to ensure all inactive objects are returned to their parent slabs before
    checking for empty slabs.
+
 
 Critical Safety Warnings
 ========================
@@ -177,7 +205,6 @@ Critical Safety Warnings
 
 Diagnostics
 ===========
-
 Diagnostics can be triggered via ``slab_debug_dump()`` to inspect memory
 utilization across all registered caches:
 
@@ -189,6 +216,7 @@ utilization across all registered caches:
       size-64       64      64      120     102     2
       proc_t        512     512     16      14      2
 
+
 Reference
 =========
 
@@ -196,9 +224,11 @@ Reference
   allocator," in Proc. USENIX Summer 1994 Tech. Conf., Boston, MA, USA,
   1994, pp. 87–98.
 
+
 Related Files
 =============
 
 - ``include/slab.h``
 - ``mm/slab.c``
+- ``test/test_slab.c``
 

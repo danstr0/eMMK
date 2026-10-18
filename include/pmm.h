@@ -7,16 +7,17 @@
  *
  * @par Initialization
  * @c pmm_init() is called from @c kernel_main() with the Multiboot2 memory
- * map. It scans available regions, reserves the kernel and bitmap 
- * themselves, and marks all other available frames as free.
+ * map. It records the RAM regions, places the bitmap in free RAM below
+ * 1 GiB, reserves the low 1 MiB, the kernel image, the Multiboot2 info
+ * structure and the bitmap, and marks all other available frames free.
  *
- * Allocation functions return physical addresses (@c uint64_t). Use 
- * @c PHYS_TO_VIRT() to obtain a usable virtual pointer within the 
- * higher-half direct mapping.
+ * Allocation functions return physical addresses (@c uint64_t). Use
+ * @c PHYS_TO_VIRT() to obtain a usable pointer through the direct map
+ * (after @c vmm_init()), or @c pmm_phys_to_virt() at any boot stage.
  *
  * @par Error convention
- * Allocation functions return @c PMM_ALLOC_FAILED (0) on failure. Physical
- * address 0 is never a valid allocation target.
+ * Allocation functions return @c PMM_ALLOC_FAILED (0) on failure.
+ * Physical address 0 is never a valid allocation target.
  */
 
 #ifndef EMMK_PMM_H
@@ -27,6 +28,15 @@
 /// Allocation sentinel - returned on failure. Physical address 0 is
 /// never allocated, so 0 is an unambiguous error value.
 #define PMM_ALLOC_FAILED  0
+
+/**
+ * Highest physical address the PMM manages (1 TiB). Bounds the bitmap
+ * (32 MiB at the limit), which must fit in free RAM below 1 GiB.
+ */
+#define PMM_MAX_MEMORY    (1UL << 40)
+
+/// Maximum number of memory-map regions recorded for the direct map.
+#define PMM_MAX_REGIONS   64
 
 /// Snapshot of PMM state for diagnostics.
 struct pmm_stats
@@ -39,21 +49,55 @@ struct pmm_stats
     uint64_t max_physical_addr;  ///< One past the highest managed address.
 };
 
+/**
+ * @brief A physical region that belongs in the direct map.
+ *
+ * Covers memory-map entries of type available, ACPI reclaimable and
+ * ACPI NVS: all ordinary RAM, safe to map write-back. Device memory
+ * (MMIO) never appears here.
+ */
+struct pmm_region
+{
+    uint64_t start;  ///< First byte (physical).
+    uint64_t end;    ///< One past the last bye (physical).
+    uint32_t type;   ///< @c MULTIBOOT2_MEMORY_* type.
+};
+
 /// @name Initialization
 /// @{
+
+struct multiboot2_tag_mmap;
 
 /**
  * @brief Initialize the physical memory manager.
  *
- * Scans the Multiboot2 memory map to determine available physical regions,
- * places the bitmap immediately after multiboot info or the kernel
- * image, and marks the kernel image, multiboot info, and bitmap as reserved.
- * @b Must be called before any allocation functions.
+ * @param mmap       Multiboot2 memory map tag.
+ * @param mbi_start  Physical address of the Multiboot2 info structure.
+ * @param mbi_end    One past its last byte (physical).
  *
- * @param mmap  Multiboot2 memory map tag.
+ * @b Must be called before any allocation function. Until
+ * @c pmm_enable_direct_map() is called, the PMM accesses its bitmap and
+ * zeroes pages through the boot mapping (first 1 GiB only).
  */
-struct multiboot2_tag_mmap;
-void pmm_init(struct multiboot2_tag_mmap *mmap, uint64_t mb_info_end);
+void pmm_init(struct multiboot2_tag_mmap *mmap,
+              uint64_t mbi_start, uint64_t mbi_end);
+
+/**
+ * @brief Switch the PMM to the direct map.
+ *
+ * Called once by @c vmm_init() immediately after loading the kernel's
+ * own page tables. From then on @c pmm_phys_to_virt() is equivalent to
+ * @c PHYS_TO_VIRT() and any frame can be zeroed.
+ */
+void pmm_enable_direct_map(void);
+
+/**
+ * @brief Translate a physical address at any boot stage.
+ *
+ * Before the direct map exists, only addresses below @c BOOT_MAP_LIMIT
+ * are reachable (via @c BOOT_PHYS_TO_VIRT); after, any RAM address.
+ */
+void *pmm_phys_to_virt(uint64_t paddr);
 /// @}
 
 /// @name Page allocation
@@ -77,7 +121,9 @@ uint64_t pmm_alloc_pages(size_t count);
 /**
  * @brief Allocate @p count contiguous, naturally-aligned page frames.
  *
- * The returned physical address is aligned to @p align_pages * @c PAGE_SIZE.
+ * The returned physical address is aligned to `align_pages * PAGE_SIZE`.
+ * @c pmm_alloc_aligned(512, 512) yields one 2 MiB-aligned 2 MiB block,
+ * suitable for a large-page mapping.
  *
  * @param count        Number of contiguous frames required.
  * @param align_pages  Alignment in pages (must be a power of two).
@@ -87,6 +133,10 @@ uint64_t pmm_alloc_aligned(size_t count, size_t align_pages);
 
 /**
  * @brief Allocate a single page frame and zero its contents.
+ *
+ * Before @c pmm_enable_direct_map(), fails (returns @c PMM_ALLOC_FAILED)
+ * if the only free frame lies above the boot mapping.
+ *
  * @return Physical address of the zeroed frame,
  *         or @c PMM_ALLOC_FAILED.
  */
@@ -120,6 +170,16 @@ void pmm_free_pages(uint64_t paddr, size_t count);
 void pmm_get_stats(struct pmm_stats *stats);
 /// @}
 
+/// @name Memory regions
+/// @{
+
+/// @return Number of recorded RAM regions (see `struct pmm_region`).
+size_t pmm_region_count(void);
+
+/// @return Region @p index, or @c NULL if out of range.
+const struct pmm_region *pmm_get_region(size_t index);
+/// @}
+
 /// @name Bitmap range manipulation
 /// @{
 
@@ -129,8 +189,7 @@ void pmm_get_stats(struct pmm_stats *stats);
  * @param start  First byte of the range (rounded down to page boundary).
  * @param end    One past the last byte (exclusive, rounded up).
  *
- * Used during init to reserve the kernel image, Multiboot2 structures,
- * and other regions that must not be allocated.
+ * Used to reserve regions that must never be allocated.
  */
 void pmm_mark_used(uint64_t start, uint64_t end);
 
