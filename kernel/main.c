@@ -286,8 +286,13 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
 
     uint64_t mb_info_phys = VIRT_TO_PHYS_ADDR((uintptr_t)mb_info);
     uint64_t mb_info_end  = mb_info_phys + mb_info->total_size;
-    pmm_init(mmap, mb_info_end);
+    pmm_init(mmap, mb_info_phys, mb_info_end);
     vmm_init();
+
+    // The boot window that mb_info pointed to is gone; re-point it at
+    // the direct map (still needed for ACPI discovery)
+    mb_info = (struct multiboot2_info *)PHYS_TO_VIRT(mb_info_phys);
+    mmap = NULL;
     heap_init();
     slab_init();
 
