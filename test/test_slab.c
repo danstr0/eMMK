@@ -31,7 +31,7 @@ uint32_t test_slab(void)
 
         void *obj = slab_alloc(c);
         TEST_ASSERT(obj != NULL, "slab_alloc non-NULL");
-        TEST_ASSERT_EQ((uintptr_t)obj % SLAB_MIN_ALIGN, 0,
+        TEST_ASSERT_EQ((uintptr_t)obj % CACHE_LINE_SIZE, 0,
                        "slab object aligned");
 
         // Verify the object is writable

@@ -20,9 +20,14 @@
  * @endcode
  *
  * @par Alignment & Layout
- * All slab objects are aligned to @c SLAB_MIN_ALIGN (16 bytes) or their
- * effective size. Slabs are power-of-two sized so that object-to-slab
- * header navigation can be performed in O(1) time using bitwise masking.
+ * Objects of @c CACHE_LINE_SIZE (64) bytes or more are cache-line
+ * aligned; smaller objects are aligned to @c SLAB_MIN_ALIGN (16). Slabs
+ * are power-of-two sized so that object-to-slab header navigation can be
+ * performed in O(1) time using bitwise masking. Slab memory is physically
+ * contiguous and in the direct map, so objects are DMA-safe.
+ *
+ * @warning Not interrupt-safe; do not allocate or free from interrupt
+ *          handlers (see slab.c).
  *
  * Depends on the PMM for raw pages and the kernel heap for cache
  * descriptors. Must be initialized after @c heap_init().
