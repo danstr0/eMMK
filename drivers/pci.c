@@ -422,23 +422,17 @@ int pci_msix_enable(struct pci_device *dev)
         return -1;
     }
 
-    // Map the MSI-X table into virtual memory
+    // Map the MSI-X table (uncached); each device gets its own mapping
     uint64_t table_phys = bar_phys + table_offset;
     size_t table_size   = dev->msix_count * sizeof(struct msix_entry);
-    size_t pages        = PAGE_ALIGN_UP(table_size) / PAGE_SIZE;
-
-    uint64_t vaddr = 0xFFFFFFFFFFC00000UL;  // PDPT[511], below LAPIC/IOAPIC
-    for (size_t i = 0; i < pages; ++i)
-        if (vmm_map_page(vaddr + i * PAGE_SIZE,
-                         PAGE_ALIGN_DOWN(table_phys) + i * PAGE_SIZE,
-                         PTE_MMIO) != VMM_OK)
-        {
-            kprintf("[PCI] Failed to map MSI-X table\n");
-            return -1;
-        }
-
+    
     dev->msix_table = (volatile struct msix_entry *)
-        (vaddr + (table_phys & (PAGE_SIZE - 1)));
+                      vmm_map_mmio(table_phys, table_size);
+    if (!dev->msix_table)
+    {
+        kprintf("[PCI] Failed to map MSI-X table\n");
+        return -1;
+    }
 
     // Mask all vectors initially
     for (uint16_t i = 0; i < dev->msix_count; ++i)
