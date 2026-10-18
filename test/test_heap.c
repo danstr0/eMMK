@@ -5,6 +5,7 @@
 
 #include "test.h"
 #include "heap.h"
+#include "vmm.h"
 
 uint32_t test_heap(void)
 {
@@ -29,6 +30,32 @@ uint32_t test_heap(void)
         TEST_ASSERT(ptr != NULL, "kmalloc(1) non-NULL");
         TEST_ASSERT_EQ((uintptr_t)ptr % HEAP_ALIGNMENT, 0,
                        "aligned to HEAP_ALIGNMENT");
+        kfree(ptr);
+    
+        // A run of consecutive blocks: with a header size
+        // that is not a multiple of HEAP, alignment,
+        // alignment alternates block to block, so checking
+        // a single allocation can pass by luck.
+        void *ptrs[8];
+        bool all_aligned = true;
+        for (int i = 0; i < 8; ++i)
+        {
+            ptrs[i] = kmalloc(16 + i * 16);
+            if (!ptrs[i] || ((uintptr_t)ptrs[i] % HEAP_ALIGNMENT) != 0)
+                all_aligned = false;
+        }
+        TEST_ASSERT(all_aligned, "consecutive allocations all aligned");
+        for (int i = 0; i < 8; ++i)
+            kfree(ptrs[i]);
+    }
+
+    // ── Heap addresses translate via page walk ──────────
+    {
+        void *ptr = kmalloc(64);
+        TEST_ASSERT((uint64_t)ptr >= HEAP_VIRTUAL_BASE, "heap in its window");
+        TEST_ASSERT_EQ(virt_to_phys(ptr), vmm_get_physical((uint64_t)ptr),
+                       "virt_to_phys walks heap addresses");
+        TEST_ASSERT(virt_to_phys(ptr) != 0, "heap pointer is mapped");
         kfree(ptr);
     }
 
