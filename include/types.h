@@ -151,6 +151,13 @@ STATIC_ASSERT(sizeof(size_t)    == 8, "size_t must be 8 bytes on x86-64");
 #define LIKELY(x)    __builtin_expect(!!(x), 1)
 #define UNLIKELY(x)  __builtin_expect(!!(x), 0)
 
+/// Cache line size on all x86-64 CPUs eMMK targets.
+#define CACHE_LINE_SIZE  64
+
+/// ALIGN (and therefore pad) a type of variable to a full cache line, so
+/// data written by different cores never shares a line.
+#define CACHE_ALIGNED    ALIGNED(CACHE_LINE_SIZE)
+
 /// Mark a function as printf-like for compile-time format-string checking.
 #define PRINTF_FMT(fmt, args)  __attribute__((format(printf, fmt, args)))
 /// @}
