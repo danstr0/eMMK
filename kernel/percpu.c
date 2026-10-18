@@ -9,6 +9,7 @@
  */
 
 #include "percpu.h"
+#include "kernel.h"
 #include "tss.h"
 #include "apic.h"
 #include "heap.h"
@@ -83,8 +84,9 @@ void percpu_init_bsp(void)
     }
 
     // Store the BSP's kernel stack top
+    // (physical address symbol; the BSP runs on its higher-half alias)
     extern char stack_top[];
-    p->rsp0 = (uint64_t)stack_top;
+    p->rsp0 = (uint64_t)stack_top + KERNEL_VIRTUAL_BASE;
 
     all_percpu[0] = p;
     set_gs_base(p);
