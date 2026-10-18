@@ -47,19 +47,27 @@ SECTIONS
 
     .boot ALIGN(4K) : AT(ADDR(.boot))
     {
+        __boot_start = .;
         KEEP(*(.multiboot2))
         *(.text32)
         *(.rodata32)
+        . = ALIGN(4K);
+        __boot_end = .;
     }
 
     .boot_page_tables ALIGN(4K) (NOLOAD) : AT(ADDR(.boot_page_tables))
     {
+        __boot_page_tables_start = .;
         *(.boot_page_tables)
+        __boot_page_tables_end = .;
     }
 
-    .boot_stack ALIGN(16) (NOLOAD) : AT(ADDR(.boot_stack))
+    .boot_stack ALIGN(4K) (NOLOAD) : AT(ADDR(.boot_stack))
     {
+        __boot_stack_start = .;
         *(.boot_stack)
+        . = ALIGN(4K);
+        __boot_stack_end = .;
     }
 
     /* ───────────────────────────────────────────────────────────────────
@@ -72,6 +80,8 @@ SECTIONS
     {
         _ap_trampoline_lma = .;
         KEEP(*(.ap_trampoline))
+        . = ALIGN(4K);
+        __ap_trampoline_end = .;
     }
 
     /* ───────────────────────────────────────────────────────────────────
@@ -88,18 +98,25 @@ SECTIONS
 
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRTUAL_BASE)
     {
+        __text_start = .;
         *(.text)
         *(.text.*)
+        . = ALIGN(4K);
+        __text_end = .;
     }
 
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRTUAL_BASE)
     {
+        __rodata_start = .;
         *(.rodata)
         *(.rodata.*)
+        . = ALIGN(4K);
+        __rodata_end = .;
     }
 
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VIRTUAL_BASE)
     {
+        __data_start = .;
         *(.data)
         *(.data.*)
     }
