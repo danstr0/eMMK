@@ -15,9 +15,11 @@
  * On expansion, the new region is coalesced with the previous tail block
  * if it was free, preventing boundary fragmentation.
  *
- * The heap lives at a dedicated virtual address range
- * (@c HEAP_VADDR_BASE) and grows upward by allocating physical pages
- * from the PMM and mapping them via the VMM.
+ * The heap resides at a dedicated virtual address range
+ * (@c HEAP_VIRTUAL_BASE) and grows upward by allocating physical pages
+ * from the PMM one at a time and mapping them via the VMM. Heap memory is
+ * therefore virtually contiguous but @b not physically contiguous, and
+ * must never be used as a DMA buffer.
  */
 
 #include "heap.h"
@@ -34,6 +36,10 @@
  *
  * The doubly-linked physical-order list gives O(1) neighbor access for
  * coalescing; the doubly-linked free list gives O(1) removal.
+ *
+ * Aligned to @c HEAP_ALIGNMENT so its size is a multiple of it: heap
+ * regions start page-aligned and block sizes are multiples of
+ * @c HEAP_ALIGNMENT, so every user pointer (header + size) is aligned.
  */
 struct block_header
 {
@@ -44,7 +50,10 @@ struct block_header
     struct block_header *next_free;  ///< Next block in free list (if free).
     struct block_header *prev_free;  ///< Previous block in free list.
     uint32_t magic;                  ///< @c BLOCK_MAGIC for corruption detection.
-};
+} ALIGNED(HEAP_ALIGNMENT);
+
+STATIC_ASSERT(sizeof(struct block_header) % HEAP_ALIGNMENT == 0,
+              "block header size must preserve HEAP_ALIGNMENT");
 
 #define BLOCK_MAGIC        0xDEADBEEF
 #define BLOCK_HEADER_SIZE  sizeof(struct block_header)
@@ -82,10 +91,8 @@ static size_t   heap_used_size;
 static uint64_t heap_num_allocs;
 static uint64_t heap_num_frees;
 
-/// Next virtual address available for heap expansion.
+/// Base virtual address of the heap (@c HEAP_VIRTUAL_BASE).
 static uint64_t heap_vaddr;
-
-#define HEAP_VADDR_BASE  0xFFFFFFFFC0000000UL
 
 /**
  * Protects all heap state (block lists, free list, counters, vaddr).
@@ -141,6 +148,32 @@ static inline bool block_validate(struct block_header *block,
 // ── Heap expansion ─────────────────────────────────────────────────────
 
 /**
+ * @brief Back [@p vaddr, @p vaddr + @p num_pages pages) with fresh frames.
+ *
+ * Frames are allocated individually: the heap never needs physical
+ * contiguity, so expansion cannot fail merely because RAM is fragmented.
+ * On failure everything mapped so far is released.
+ */
+static bool heap_map_new_pages(uint64_t vaddr, size_t num_pages)
+{
+    for (size_t i = 0; i < num_pages; ++i)
+    {
+        uint64_t paddr = pmm_alloc_page();
+        if (paddr == PMM_ALLOC_FAILED
+            || vmm_map_page(vaddr + i * PAGE_SIZE, paddr,
+                            PTE_KERNEL_RW) != VMM_OK)
+        {
+            if (paddr != PMM_ALLOC_FAILED)
+                pmm_free_page(paddr);
+            for (size_t j = 0; j < i; ++j)
+                pmm_free_page(vmm_unmap_page(vaddr + j * PAGE_SIZE));
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
  * @brief Grow the heap by at least @p min_size bytes.
  *
  * Allocates physical pages, maps them at the end of the heap, and
@@ -161,19 +194,10 @@ static bool heap_expand(size_t min_size)
     }
 
     size_t num_pages = expand_size / PAGE_SIZE;
-    uint64_t paddr = pmm_alloc_pages(num_pages);
-    if (paddr == PMM_ALLOC_FAILED)
-    {
-        kprintf("[HEAP] Cannot expand: out of physical memory\n");
-        return false;
-    }
-
     uint64_t vaddr = heap_vaddr + heap_total_size;
-    if (vmm_map_pages(vaddr, paddr, num_pages,
-                      PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE) != VMM_OK)
+    if (!heap_map_new_pages(vaddr, num_pages))
     {
-        pmm_free_pages(paddr, num_pages);
-        kprintf("[HEAP] Cannot expand: virtual mapping failed\n");
+        kprintf("[HEAP] Cannot expand: out of memory\n");
         return false;
     }
 
@@ -304,7 +328,7 @@ void heap_init(void)
 {
     kprintf("[HEAP] Initializing kernel heap...\n");
 
-    heap_vaddr      = HEAP_VADDR_BASE;
+    heap_vaddr      = HEAP_VIRTUAL_BASE;
     heap_total_size = 0;
     heap_used_size  = 0;
     heap_num_allocs = 0;
@@ -313,18 +337,8 @@ void heap_init(void)
     heap_end        = NULL;
     free_list       = NULL;
 
-    size_t init_pages = HEAP_INITIAL_SIZE / PAGE_SIZE;
-    uint64_t paddr = pmm_alloc_pages(init_pages);
-    if (paddr == PMM_ALLOC_FAILED)
+    if (!heap_map_new_pages(heap_vaddr, HEAP_INITIAL_SIZE / PAGE_SIZE))
     {
-        kprintf("[HEAP] ERROR: Cannot allocate initial pages\n");
-        return;
-    }
-
-    if (vmm_map_pages(heap_vaddr, paddr, init_pages,
-                      PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE) != VMM_OK)
-    {
-        pmm_free_pages(paddr, init_pages);
         kprintf("[HEAP] ERROR: Cannot allocate initial pages\n");
         return;
     }
