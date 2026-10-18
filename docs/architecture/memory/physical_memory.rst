@@ -77,32 +77,49 @@ Scope of Synchronized Operations
 
 Initialization Sequence
 =======================
-During the early boot phase, the PMM must be initialized before the kernel
-can enable paging or start complex subsystems. The ``pmm_init()`` function
-performs the following sequence:
+The PMM is the first memory subsystem initialized, while the boot page
+tables (first 1 GiB only) are still active. ``pmm_init(mmap, mbi_start,
+mbi_end)`` performs:
 
-1. **Parse Multiboot2 Map:** Scans the memory map provided by the bootloader
-   to identify usable RAM regions and "holes" (MMIO, reserved firmware
-   space).
-2. **Bitmap Placement:** Calculates the required bitmap size and places it
-   in physical memory immediately following the kernel's binary image.
-3. **Default State:** Initially marks the entire address space as Reserved
-   (all bits set to 1).
-4. **Region Discovery:** Iterates through the Multiboot2 map and marks all
-   "Available" RAM regions as Free (bits cleared to 0).
-5. **Critical Reservation:** Explicitly re-reserves the following to
-   prevent accidental overwriting:
+1. **Record RAM regions:** Copies every memory-map entry of type
+   available, ACPI reclaimable, or ACPI NVS into ``pmm_regions[]`` (at
+   most ``PMM_MAX_REGIONS``). The VMM builds the direct map from these
+   (``pmm_region_count()`` / ``pmm_get_region()``).
+2. **Size the bitmap:** One bit per page up to the highest *available*
+   address, capped at ``PMM_MAX_MEMORY`` (1 TiB → 32 MiB bitmap).
+3. **Place the bitmap:** In the first available region that has room
+   below 1 GiB (it must be reachable through the boot window), sliding
+   past the kernel image and the Multiboot2 info structure. Previously
+   the bitmap was put immediately after the kernel without checking
+   that the memory there was actually available.
+4. **Default State:** Marks every page reserved (all bits set).
+5. **Region Discovery:** Clears the bits for every available region.
+6. **Critical Reservation:** Re-reserves exactly:
 
-    - The kernel image (``text``, ``data``, ``rodata``, ``bss``).
-    - The PMM bitmap itself.
-    - Multiboot2 information structures and module payloads.
-    - Physical page 0 (used as a sentinel/error value).
+    - the low 1 MiB (IVT, BDA, EBDA, BIOS ROM, AP trampoline; page 0 is
+      also the error sentinel);
+    - the kernel image (``_kernel_physical_start`` ..
+      ``_kernel_physical_end``, including the boot page tables and boot
+      stack);
+    - the Multiboot2 information structure;
+    - the bitmap itself.
+
+``vmm_init()`` then calls ``pmm_enable_direct_map()`` right after loading
+the kernel's own page tables; from then on the bitmap is accessed through
+the direct map and any frame can be zeroed.
 
 Addressing and Conversion
 =========================
 The PMM operates exclusively on physical addresses (represented as
 ``uint64_t``). Because eMMK operates in a higher-half virtual address
 space, addresses returned by the PMM cannot be dereferenced directly.
+
+- After ``vmm_init()``: ``PHYS_TO_VIRT(paddr)`` (direct map) works for
+  every RAM address.
+- At any stage: ``pmm_phys_to_virt(paddr)`` uses the boot window
+  (below 1 GiB only) before the direct map exists and the direct map
+  afterwards. ``pmm_alloc_page_zero()`` uses it, and refuses (returns
+  ``PMM_ALLOC_FAILED``) if an early allocation lands above 1 GiB.
 
 .. code-block:: c
 
@@ -119,7 +136,8 @@ space, addresses returned by the PMM cannot be dereferenced directly.
   memset(ptr, 0, PAGE_SIZE);
 
 Refer to ``include/kernel.h`` for the standard conversion macros
-(``PHYS_TO_VIRT``, ``VIRT_TO_PHYS``).
+(``PHYS_TO_VIRT``, ``VIRT_TO_PHYS``) and :doc:`memory_layout` for where
+everything resides.
 
 Allocation API
 ==============
@@ -139,6 +157,8 @@ Allocation API
    * - ``pmm_alloc_aligned(n, a)``
      - Allocates ``n`` contiguous, naturally-aligned page frames. The
        returned physical address is aligned to ``a`` * ``PAGE_SIZE``.
+       ``pmm_alloc_aligned(512, 512)`` yields a 2 MiB block suitable for
+       a large-page mapping.
    * - ``pmm_free_page(p)``
      - Releases a single frame at physical address ``p``.
    * - ``pmm_free_pages(p, n)``
@@ -154,8 +174,9 @@ or the Interrupt Vector Table (IVT), making it an ideal sentinel value.
 Range Reservation
 =================
 The PMM provides low-level functions to manually toggle the state of
-memory ranges. This is primarily used by drivers to reserve specific
-hardware buffers or by the kernel to protect bootloader-passed assets.
+memory ranges (``pmm_mark_used`` / ``pmm_mark_free``, both lock-protected).
+This is primarily used by drivers to reserve specific hardware buffers
+or by the kernel to protect bootloader-passed assets.
 
 .. code-block:: c
 
@@ -186,7 +207,12 @@ metadata density. However, it presents specific performance characteristics:
 - **Cons:** Contiguous allocation (``pmm_alloc_pages``) requires a linear
   search through the bitmap, which can become ``O(n)`` (where ``n`` is
   the number of bits), potentially leading to performance degradation under
-  heavy fragmentation.
+  heavy fragmentation. Fully allocated 64-page words are skipped whole,
+  which keeps the scan fast while it is outside a candidate run.
+  ``pmm_alloc_aligned`` always scans from PFN 0.
+
+Neither cost matters on the data path: packet buffers come from slab
+caches, which reach the PMM only when a cache grows.
 
 References
 ==========

@@ -18,8 +18,9 @@ the 4 KiB granularity of the vmm.
    * - **Alignment**
      - 16-byte (compatible with x86-64 ABI and SSE).
    * - **Backing Store**
-     - Virtual memory mapped via the vmm using physical-memory
-       frames.
+     - Individual PMM frames mapped at ``HEAP_VIRTUAL_BASE``
+       (``0xFFFF_C000_0000_0000``). Virtually contiguous, **not**
+       physically contiguous.
 
 
 Implementation Strategy
@@ -36,9 +37,18 @@ tracks the block's size and its status.
   fragmentation, the allocator immediately checks the physically adjacent
   neighbors; if they are also free, they are coalesced into a single,
   larger contiguous block.
-- **Growth:** If the heap cannot satisfy an allocation, it requests new
-  pages from the VMM/PMM to expand the heap's end boundary, up to a maximum
-  of 16 MiB.
+- **Growth:** If the heap cannot satisfy an allocation, it allocates
+  frames from the PMM *one page at a time* and maps them at the heap's
+  end, up to a maximum of 16 MiB.
+
+.. warning::
+
+   Heap memory must never be given to a device for DMA, and
+   ``VIRT_TO_PHYS`` must never be used on it: it is neither physically
+   contiguous nor in the direct map. Use slab or PMM memory for DMA
+   buffers; ``virt_to_phys()`` (vmm.h) will correctly walk the page
+   tables for a heap pointer if a physical address is needed for
+   diagnostics.
 
 
 Memory Layout and Alignment
@@ -51,8 +61,18 @@ This is critical for:
 - **SIMD Operations:** Instructions like ``movaps`` (SSE) require 16-byte
   alignment to avoid General Protection Faults.
 
+The guarantee holds because the block header is itself padded to a
+multiple of 16 bytes (``ALIGNED(HEAP_ALIGNMENT)``, 64 bytes): regions
+start page-aligned and block sizes are multiples of 16, so header + size
+keeps every user pointer aligned.
+
+For stricter alignment (e.g., a 64-byte cache line, as the slab allocator
+uses for its cache descriptors) use ``kaligned_alloc``. Its pointers are
+freed with ``kfree`` but must not be passed to ``krealloc``.
+
 Any request smaller than 32 bytes (``HEAP_MIN_ALLOC``) is automatically
-rounded up to ensure metadata overhead does not excessively fragment the heap.
+rounded up to ensure metadata overhead does not excessively fragment the
+heap.
 
 
 Core API
@@ -130,6 +150,7 @@ References
 
 Related Files
 =============
-- ``kernel/heap.h``
+- ``include/heap.h``
 - ``mm/heap.c``
+- ``test/test_heap.c``
 

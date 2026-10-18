@@ -251,7 +251,8 @@ Starting at 1 MiB, the linker emits the boot sections in this order
      - Multiboot2 header, 32-bit entry, ``long_mode_start``, boot GDT
    * - ``.boot_page_tables``
      - 12 KiB
-     - PML4, PDPT, PD (NOLOAD). **Still the live page tables**.
+     - PML4, PDPT, PD (NOLOAD). Live until ``vmm_init()`` switches to the
+       kernel's own tables; then unmapped (guard page for the boot stack).
    * - ``.boot_stack``
      - 16 KiB
      - BSP stack (NOLOAD)
@@ -261,6 +262,13 @@ Starting at 1 MiB, the linker emits the boot sections in this order
    * - ``.text`` ... ``bss``
      - —
      - Higher-half kernel (VMA ``0xFFFF_FFFF_8000_0000`` + physical)
+
+.. note::
+
+   The BSP stack sits directly above the boot page tables. Once
+   ``vmm_init()`` has replaced them, their pages are left unmapped and
+   act as the stack's guard page: an overflow faults instead of silently
+   corrupting memory.
 
 The linker script also places the linker-synthesized dynamic sections
 (``.got``, ``.plt``, ``.rela.*``) and asserts that they are empty, and
@@ -280,7 +288,9 @@ When ``kernel_main()`` begins executing, the following invariants hold:
 - Execution is in the higher-half address space.
 - RDI contains a higher-half pointer to the Multiboot2 info structure.
 - Interrupts are disabled (IF = 0).
-- CR3 points at the boot PML4, which the rest of the kernel keeps using.
+- CR3 points at the boot PML4, which stays active until ``vmm_init()``
+  (see :doc:`memory/virtual_memory`). The MBI pointer in RDI is only
+  valid until then.
 
 
 Multiboot2 Information Structure

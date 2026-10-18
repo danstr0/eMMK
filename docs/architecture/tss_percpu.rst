@@ -220,7 +220,7 @@ Boot Sequence Flow
       4. smp_init()  ──► [ AP Core Initialization (ap_entry) ]
                                       │
                                       ▼
-                         1. tss_init_ap(core_index)
+                         1. tss_init_ap(core_index, stack_top)
                             ├── Allocates IST1/IST2 for AP
                             ├── Populates TSS Descriptor
                             ├── Executing lgdt (runtime_gdt_ptr)
@@ -244,7 +244,7 @@ TSS Functions
    and issues ``ltr`` for core 0. Must be invoked on the BSP before
    initializing SMP.
 
-.. c:function:: void tss_init_ap(int core_index)
+.. c:function:: void tss_init_ap(int core_index, uint64_t stack_top)
 
    Initializes TSS and IST stacks for an Application Processor, writes its
    16-byte TSS descriptor into the shared ``runtime_gdt``, loads the
