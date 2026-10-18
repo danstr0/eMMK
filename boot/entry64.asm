@@ -132,10 +132,12 @@ higher_half_entry:
 ;;; higher-half code, RSP is relocated to the equivalent higher-half alias
 ;;; so the stack remains accessible once the identity mapping is torn down.
 ;;;
-;;; @warning This stack has no guard page. The linker places it directly
-;;;          above @c .boot_page_tables, which remain in the live page
-;;;          tables. Overflowing the BSP stack silently corrupts the PD.
-;;;          To be fixed when the VMM builds the kernel's own page tables.
+;;; The linker places it directly above @c .boot_page_tables. Once
+;;; @c vmm_init() switches to the kernel's own page tables, the boot tables
+;;; are dead and left unmapped, so they act as a guard page: overflowing
+;;; this stack faults (#PF → #DF on its IST stack) instead of silently
+;;; corrupting memory. Before @c vmm_init(), an overflow would still
+;;; overwrite the live boot PD.
 ;;;
 ;;; @{
 
