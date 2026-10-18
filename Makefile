@@ -44,7 +44,10 @@ LDFLAGS := -nostdlib               \
 
 # ── QEMU flags ──────────────────────────────────────────────────────────
 
-QEMU_BASE := -m 128M -serial stdio -display none
+## Guest RAM (e.g., MEM=4G)
+MEM ?= 128M
+
+QEMU_BASE := -m $(MEM) -serial stdio -display none
 QEMU_NET  := -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=udp::8080-:7
 QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
