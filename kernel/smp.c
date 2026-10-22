@@ -273,8 +273,10 @@ NORETURN void ap_entry(void)
     barrier();
 
     // Wait for the BSP to assign a role and launch
+    __asm__ volatile("cli");
     while (!cores[my_core].launched)
-        __asm__ volatile("sti;hlt");
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+    __asm__ volatile("sti");
 
     if (cores[my_core].run_func)
     {
@@ -385,9 +387,8 @@ void smp_launch_all(void)
         {
             cores[i].launched = true;
 
-            // Send a fixed vector IPI or direct interrupt to wake AP from HLT
-            lapic_write(LAPIC_ICR_HIGH, cores[i].apic_id << 24);
-            lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_LEVEL_ASSERT | APIC_SPURIOUS_VECTOR);
+            // Wake the AP from HLT
+            lapic_send_ipi(cores[i].apic_id, APIC_WAKE_VECTOR);
         }
     barrier();
 }
