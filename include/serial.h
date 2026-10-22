@@ -168,6 +168,9 @@ void serial_puts(uint16_t port, const char *s);
 PRINTF_FMT(2, 3)
 void serial_printf(uint16_t port, const char *fmt, ...);
 
+/// @c va_list form of @c serial_printf.
+void serial_vprintf(uint16_t port, const char *fmt, __builtin_va_list args);
+
 /**
  * @brief Switch console output to lock-free panic mode (irreversible).
  *

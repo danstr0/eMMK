@@ -114,11 +114,14 @@ ISR_NOERR 31       ;      Reserved
 ;;;   [RSP+16]  RIP            (pushed by CPU)
 ;;;   [RSP+24]  CS             (pushed by CPU)
 ;;;   [RSP+32]  RFLAGS         (pushed by CPU)
-;;;  [RSP+40]  RSP            (pushed by CPU)
-;;;  [RSP+48]  SS             (pushed by CPU)
+;;;   [RSP+40]  RSP            (pushed by CPU)
+;;;   [RSP+48]  SS             (pushed by CPU)
 ;;; @endcode
 ;;; @{
 isr_common:
+    ;; The System V ABI requires DF=0 on entry to any C function
+    cld
+
     ;; Save all general-purpose registers.
     push rax
     push rbx

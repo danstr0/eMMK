@@ -133,9 +133,6 @@ void virtio_net_irq_handler(struct interrupt_frame *frame)
     // Read ISR status to acknowledge the interrupt (read clears it)
     (void)inb(g_virtio_net->vdev->io_base + VIRTIO_PCI_ISR_STATUS);
 
-    // Process both RX and TX completions
-    virtio_net_poll(g_virtio_net);
-
     lapic_eoi();
 }
 

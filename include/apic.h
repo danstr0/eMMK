@@ -19,10 +19,12 @@
  * - Programmable routing table (24 entries on standard I/O APIC).
  *
  * @par Initialization order
- * 1. @c pic_disable()      — mask all legacy PIC IRQs.
- * 2. @c lapic_init()       — enable Local APIC, set spurious vector.
- * 3. @c ioapic_init()      — configure I/O APIC routing table.
- * 4. @c lapic_timer_init() — set up periodic timer.
+ * 1. @c pic_init()    — remap the legacy PIC away from exceptions.
+ * 2. @c lapic_init()  — mask the PIC, enable the Local APIC, set the
+ *                       spurious, error, and wake-up vectors.
+ * 3. @c ioapic_init() — map the I/O APIC and mask every entry.
+ *
+ * No periodic timer is started; see timer.h.
  */
 
 #ifndef EMMK_APIC_H
@@ -37,16 +39,16 @@
 #define MSR_IA32_APIC_BASE   0x1B
 
 /// Bootstrap processor flag (bit 8, read-only).
-#define APIC_BASE_BSP        (1ULL << 8)
+#define APIC_BASE_BSP        (1UL << 8)
 
 /// x2APIC mode enable (bit 10).
-#define APIC_BASE_X2APIC     (1ULL << 10)
+#define APIC_BASE_X2APIC     (1UL << 10)
 
 /// APIC global enable flag (bit 11).
-#define APIC_BASE_ENABLE     (1ULL << 11)
+#define APIC_BASE_ENABLE     (1UL << 11)
 
 /// Bits 12-51: Physical base address of the APIC registers.
-#define APIC_BASE_ADDR_MASK  0x000FFFFFFFFFF000ULL
+#define APIC_BASE_ADDR_MASK  0x000FFFFFFFFFF000UL
 /// @}
 
 /// @name Local APIC default base address
@@ -161,6 +163,9 @@
 /// APIC error interrupt vector.
 #define APIC_ERROR_VECTOR     49
 
+/// Wake-up IPI: brings a core out of @c hlt.
+#define APIC_WAKE_VECTOR      0xF0
+
 /// Spurious interrupt vector (traditionally @c 0xFF).
 #define APIC_SPURIOUS_VECTOR  255
 /// @}
@@ -180,6 +185,9 @@ void lapic_init(void);
 
 /// @return The current CPU's Local APIC ID.
 uint32_t lapic_id(void);
+
+/// @return @c true once @c lapic_init() has mapped the register page.
+bool lapic_is_ready(void);
 
 /**
  * @brief Signal End of Interrupt to the Local APIC.
@@ -204,11 +212,15 @@ void lapic_write(uint32_t reg, uint32_t value);
 /// @{
 
 /**
- * @brief Configure the APIC timer for periodic interrupts.
+ * @brief Start periodic APIC timer interrupts on the calling core.
  *
- * Calibrates the timer against a known time source (PIT channel 2),
- * then programs periodic mode with the calibrated count. Delivers
- * interrupts on @c APIC_TIMER_VECTOR.
+ * Calibrates the timer against PIT channel 2 (first call only), then
+ * programs periodic mode. Delivers interrupts on @c APIC_TIMER_VECTOR,
+ * whose handler counts ticks (@c lapic_timer_get_ticks()).
+ *
+ * @note Not used at boot: the kernel is tickless and keeps time with the
+ *       TSC (timer.h). This is available for code that wants a periodic
+ *       interrupt — never on a data-path core.
  *
  * @param hz  Desired interrupt frequency in Hz.
  */
@@ -239,6 +251,14 @@ void lapic_send_ipi_all(uint8_t vector);
 /// @}
 
 /**
+ * @brief Send an NMI to all other CPUs.
+ *
+ * Used by the panic path to stop every other core, including cores
+ * running with interrupts disabled.
+ */
+void lapic_send_nmi_all(void);
+
+/**
  * @brief Default I/O APIC base address.
  *
  * @note The actual address comes from the ACPI MADT. This default
@@ -263,18 +283,18 @@ void lapic_send_ipi_all(uint8_t vector);
 #define IOAPIC_MAX_REDIR        24
 
 // Redirection entry bits (64-bit entry, split across two 32-bit regs)
-#define IOAPIC_REDIR_MASKED     (1ULL << 16)  ///< Interrupt masked.
-#define IOAPIC_REDIR_LEVEL      (1ULL << 15)  ///< Level triggered.
-#define IOAPIC_REDIR_ACTIVELOW  (1ULL << 13)  ///< Active low polarity.
-#define IOAPIC_REDIR_LOGICAL    (1ULL << 11)  ///< Logical destination mode.
+#define IOAPIC_REDIR_MASKED     (1UL << 16)  ///< Interrupt masked.
+#define IOAPIC_REDIR_LEVEL      (1UL << 15)  ///< Level triggered.
+#define IOAPIC_REDIR_ACTIVELOW  (1UL << 13)  ///< Active low polarity.
+#define IOAPIC_REDIR_LOGICAL    (1UL << 11)  ///< Logical destination mode.
 
 // Delivery modes for redirection entries (bits 10:8)
-#define IOAPIC_DELMODE_FIXED    (0ULL << 8)
-#define IOAPIC_DELMODE_LOWEST   (1ULL << 8)
-#define IOAPIC_DELMODE_SMI      (2ULL << 8)
-#define IOAPIC_DELMODE_NMI      (4ULL << 8)
-#define IOAPIC_DELMODE_INIT     (5ULL << 8)
-#define IOAPIC_DELMODE_EXTINT   (7ULL << 8)
+#define IOAPIC_DELMODE_FIXED    (0UL << 8)
+#define IOAPIC_DELMODE_LOWEST   (1UL << 8)
+#define IOAPIC_DELMODE_SMI      (2UL << 8)
+#define IOAPIC_DELMODE_NMI      (4UL << 8)
+#define IOAPIC_DELMODE_INIT     (5UL << 8)
+#define IOAPIC_DELMODE_EXTINT   (7UL << 8)
 /// @}
 
 /// @name I/O APIC API

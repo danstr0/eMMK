@@ -73,45 +73,44 @@ be programmed with:
 - **Destination:** The Local APIC ID of the target CPU.
 - **Flags:** Trigger mode (Edge / Level) and Polarity (Active High / Low).
 
+Register Access
+---------------
+The LAPIC and IOAPIC register pages are mapped strong-uncacheable through
+``vmm_map_mmio()``. Every access therefore reaches the device in program
+order, and ``lapic_write()`` needs no serializing read-back.
+
 APIC Timer
 ----------
-The APIC includes a high-precision timer. Unlike the legacy PIT, the APIC
-timer runs at the CPU's bus speed. Because this speed varies between
-machines, eMMK performs a calibration sequence during ``lapic_timer_init()``:
+The APIC includes a timer that runs at the bus clock, which varies between
+machines. ``lapic_timer_init(hz)`` calibrates it against PIT channel 2 (a
+10 ms one-shot; see ``include/pit.h``) and starts periodic interrupts on
+the calling core.
 
-1. The legacy PIT (Channel 2) is used as a reference for a fixed duration
-   (e.g., 10ms).
-2. The kernel measures how many APIC ticks occur during that PIT window.
-3. The resulting frequency is used to provide accurate periodic interrupts
-   at the requested Hz.
+eMMK is tickless, so **nothing starts the APIC timer at boot**; time is
+kept by the TSC (doc:`timer`). The driver remains for code that wants a
+periodic interrupt, and the test suite uses it as an independent clock.
+
+Inter-Processor Interrupts
+--------------------------
+- ``lapic_send_ipi(apic_id, vector)`` / ``lapic_send_ipi_all(vector)``:
+  fixed-delivery IPIs. The handler msut send an EOI.
+- ``APIC_WAKE_VECTOR`` (``0xF0``): brings a core out of ``hlt``; used to
+  launch the APs.
+- ``lapic_send_nmi_all()``: NMI to all other cores; used only by the panic
+  path to stop them.
 
 
 Initialization Flow
 ===================
-To ensure a clean handoff, the kernel follows this strict initialization
-order in ``kernel_main()``:
+The kernel follows this order in ``kernel_main()``:
 
 1. ``pic_init()``: Remap legacy IRQs to avoid exception conflicts.
-2. ``lapic_init()``: Call ``pic_disable()``; discover and enable the Local
-   APIC for the bootstrap processor.
+2. ``lapic_init()``: Mask the PIC (``pic_disable()``); discover, map, and
+   enable the Local APIC; register the error, spurious, and wake-up
+   handlers.
 3. ``ioapic_init()``: Map the I/O APIC and mask all redirection entries.
-4. ``lapic_timer_init(hz)``: Calibrate and start the system heartbeat.
 
-
-.. list-table:: **APIC Vector Map**
-   :header-rows: 1
-   :widths: 20 40
-
-   * - Vector
-     - Usage
-   * - **32–47**
-     - Reserved for I/O APIC (mapped IRQs).
-   * - **48**
-     - APIC Timer.
-   * - **49**
-     - APIC Error Interrupt.
-   * - **255**
-     - Spurious Interrupt Vector.
+No timer is started. See :doc:`interrupts` for the complete vector map.
 
 
 References

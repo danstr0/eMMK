@@ -57,7 +57,8 @@ ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
 			boot/ap_trampoline.asm
 
 KERN_SRC := kernel/serial.c kernel/format.c kernel/string.c kernel/idt.c \
-			kernel/pic.c kernel/apic.c kernel/timer.c                    \
+			kernel/panic.c                                               \
+            kernel/pic.c kernel/apic.c kernel/timer.c                    \
 			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c       \
 			kernel/log.c kernel/spsc.c kernel/bench.c                    \
 			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                        \

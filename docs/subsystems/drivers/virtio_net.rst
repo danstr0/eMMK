@@ -38,27 +38,19 @@ disabled for simplicity. Therefore:
 
 The Receive Model
 =================
-Because eMMK lacks a traditional scheduler, the driver supports two modes
-of operation:
+Packets are only ever processed by polling: the kernel calls
+``virtio_net_poll()`` from its packet-processing loop, which drains the
+rings and invokes the receive callback (registered via
+``virtio_net_set_rx_callback()``) for each frame.
 
-Polling Mode
-------------
-The kernel manually calls ``virtio_net_poll()`` at a high frequency (e.g.,
-in the main packet-processing loop). This is the most efficient method for
-high-throughput network appliances as it avoids the overhead of interrupt
-context switching.
-
-Interrupt Mode
---------------
-The driver registers ``virtio_net_irq_handler`` to the IDT at vector 50.
-When a packet arrives, the device triggers an MSI-X interrupt. The ISR then
-calls the poll function to drain the rings.
-
-.. note::
-
-  Regardless of the trigger (Poll vs. Interrupt), the driver uses the
-  Receive Callback mechanism. A function must be registered via
-  ``virtio_net_set_rx_callback()`` to process incoming data.
+Wake-up Interrupt
+-----------------
+The driver also registers ``virtio_net_irq_handler`` at vector 50
+(MSI-X, targeted at the BSP). The handler only acknowledges the interrupt:
+its purpose is to wake a core idling in ``sti; hlt``. It is used to call
+``virtio_net_poll()`` itself, which re-entered the rings and the slab
+allocator whenever the interrupt arrived while the same core was already
+polling.
 
 
 Initialization Sequence

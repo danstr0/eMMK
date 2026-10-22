@@ -15,6 +15,7 @@
 
 #include "types.h"
 #include "serial.h"
+#include "panic.h"
 #include "multiboot2.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -280,8 +281,7 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     kprintf("\n");
     if (!mmap)
     {
-        kprintf("FATAL: No memory map\n");
-        for (;;) __asm__ volatile("cli; hlt");
+        panic("no Multiboot2 memory map");
     }
 
     uint64_t mb_info_phys = VIRT_TO_PHYS_ADDR((uintptr_t)mb_info);
@@ -300,11 +300,11 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     kprintf("\n");
     idt_init();
     pic_init();
-    pic_disable();
     lapic_init();
+    // TODO: IOAPIC address will eventually come from ACPI MADT
     ioapic_init(IOAPIC_BASE_PHYS_DEFAULT);
-    timer_init();
     tsc_init();
+    timer_init();
 
     // ── TSS, per-CPU, and SMP ───────────────────────────
     kprintf("\n");
@@ -371,10 +371,8 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
             (uint64_t)(hs.used_size / 1024),
             (uint64_t)(hs.free_size / 1024));
 
-    kprintf("[SUMMARY] Timer: %u Hz, uptime %lu ms\n",
-            TIMER_HZ, timer_get_ms());
-
-    kprintf("[SUMMARY] TSC: %lu MHz\n", tsc_get_freq() / 1000000);
+    kprintf("[SUMMARY] Clock: TSC %lu MHz, tickless, uptime %lu ms\n",
+            tsc_get_freq() / 1000000, timer_get_ms());
 
     if (eth0)
         kprintf("[SUMMARY] Network: %s  MAC=%s IP=%s\n",
@@ -453,11 +451,12 @@ non_demo:
 
     // ── Main poll loop ─────────────────────────────────────────────────
     kprintf("\nEntering poll loop...\n");
+    __asm__ volatile("cli");
     for (;;)
     {
         netdev_poll_all();
         netdev_process_rx();
-        __asm__ volatile("hlt");
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
     }
 }
 

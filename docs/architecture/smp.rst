@@ -205,14 +205,16 @@ Work Assignment & Dispatch
 ==========================
 1. **Discovery & Hold:** ``smp_init()`` brings all APs through long mode
    transition. Upon entering ``ap_entry()``, each AP sets its ``online``
-   flag, sets ``ap_boot_params.ap_ready = 1``, and enters a spin-wait loop
-   (``sti; hlt``) waiting for ``cores[i].launched``.
+   flag, sets ``ap_boot_params.ap_ready = 1``, and halts waiting for
+   ``cores[i].launched``. The flag is checked with interrupts disabled and
+   the AP sleeps with ``sti; hlt``, so a wake IPI arriving between the
+   check and the ``hlt`` still wakes it.
 2. **Role Assignment:** The BSP calls
    ``smp_assign_role(core_index, func, name)`` to set a per-core callback.
 3. **Synchronization & Launch:** The BSP calls ``smp_launch_all()``,
-   issuing a memory barrier and setting ``launched = true`` for all online
-   cores. Woken APs exit their wait loop and branch directly into their
-   assigned ``run_func(core_index)``.
+   setting ``launched = true`` for each online core and sending it a wake
+   IPI (``APIC_WAKE_VECTOR``). Woken APs exit their wait loop and branch
+   directly into their assigned ``run_func(core_index)``.
 
 
 References

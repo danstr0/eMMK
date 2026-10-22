@@ -32,6 +32,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "heap.h"
+#include "panic.h"
 #include "serial.h"
 #include "string.h"
 #include "spinlock.h"
@@ -393,9 +394,7 @@ static void *slab_alloc_locked(struct slab_cache *cache)
         {
             if (cache->flags & SLAB_PANIC)
             {
-                kprintf("[SLAB] PANIC: OOM in cache '%s'\n", cache->name);
-                for (;;)
-                    __asm__ volatile("cli; hlt");
+                panic("[SLAB] out of memory in cache '%s'", cache->name);
             }
             return NULL;
         }
