@@ -14,7 +14,8 @@
  * @par Interrupt flow
  * 1. CPU pushes SS, RSP, RFLAGS, CS, RIP (and error code if applicable)
  * 2. ISR stub (isr.asm) pushes a dummy error code (if needed) and the
- *    vector number, then saves all general-purpose registers.
+ *    vector number, clears DF, then saves all general-purpose registers.
+ *    FPU/SSE state is @b not saved (the kernel never uses it).
  * 3. Stub calls the C handler with a pointer to the @c interrupt_frame.
  * 4. Stub restores registers, removes error code / vector, and executes
  *    IRETQ.
@@ -165,8 +166,8 @@ typedef void (*interrupt_handler_t)(struct interrupt_frame *frame);
 /**
  * @brief Build and load the IDT.
  *
- * Registers assembly stubs for all 256 vectors, installs default
- * exception handlers for vectors 0-31, and loads the IDT via LIDT.
+ * Registers assembly stubs for all 256 vectors, installs the panic NMI
+ * handler, and loads the IDT via LIDT. Unhandled exceptions panic.
  *
  * @note Must be called before enabling interrupts (STI).
  */
@@ -206,13 +207,6 @@ void idt_set_gate(uint8_t vector, uint64_t handler, uint16_t selector,
  * called after @c tss_init() has allocated IST stacks.
  */
 void idt_configure_ist(void);
-/// @}
-
-/// @name Debug
-/// @{
-
-/// Human-readable exception names indexed by vector (0-31).
-extern const char *exception_names[EXCEPTION_COUNT];
 /// @}
 
 #endif // EMMK_IDT_H
