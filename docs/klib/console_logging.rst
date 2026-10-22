@@ -79,9 +79,7 @@ Console output is **synchronous and slow**:
   60-character line takes ~5 ms on real hardware. The calling core
   spins for that entire time **with interrupts disabled**, and every
   other core that tries to print spins on the lock.
-- Interrupts held off longer than the timer period lose timer ticks
-  (only one can be pending), so tick-based uptime drifts behind real
-  time. Prefer the TSC for timekeeping.
+- Interrupts are held off for the whole message.
 - Under KVM every ``in`` / ``out`` instruction is a VM exit; each
   character costs at least two (status poll + data write).
 - QEMU's emulated UART is effectively instantaneous, which hides all of
