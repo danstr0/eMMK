@@ -6,6 +6,7 @@
 #include "apic.h"
 #include "vmm.h"
 #include "io.h"
+#include "pit.h"
 #include "serial.h"
 #include "idt.h"
 #include "pic.h"
@@ -59,8 +60,11 @@ uint32_t lapic_read(uint32_t reg)
 void lapic_write(uint32_t reg, uint32_t value)
 {
     lapic_base[reg / 4] = value;
-    // Read back from a safe register to serialize the write 
-    (void)lapic_base[LAPIC_ID / 4];
+}
+
+bool lapic_is_ready(void)
+{
+    return lapic_base != NULL;
 }
 
 // ── Local APIC core functions ──────────────────────────────────────────
@@ -77,22 +81,7 @@ uint32_t lapic_id(void)
 
 // ── PIT-based calibration ──────────────────────────────────────────────
 
-
-// PIT channel 2 runs at a fixed 1.193182 MHz and is used as a reference
-// to measure how many APIC timer ticks elapse in a known time interval.
-//
-// PIT channel 2 I/O ports:
-//   0x42 - channel 2 count register
-//   0x43 - PIT command register
-//   0x61 - NMI / speaker gate (bit 0 = gate, bit 1 = speaker)
-
-#define PIT_FREQ        1193182
-#define PIT_CH2_DATA    0x42
-#define PIT_COMMAND     0x43
-#define PIT_GATE_PORT   0x61
-
 #define CALIBRATION_MS  10
-#define PIT_CAL_COUNT   (PIT_FREQ * CALIBRATION_MS / 1000)
 
 /**
  * @brief Measure APIC timer frequency using PIT channel 2.
@@ -107,28 +96,20 @@ static uint32_t calibrate_apic_timer(void)
     // Set APIC timer divider to 16
     lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
 
-    // Configure PIT channel 2 for one-shot mode
-    uint8_t gate = inb(PIT_GATE_PORT);
-    outb(PIT_GATE_PORT, (gate & 0xFC) | 0x01); // enable gate, disable speaker
-    outb(PIT_COMMAND, 0xB0);                   // ch2, lo/hi byte, mode 0
-    outb(PIT_CH2_DATA, (uint8_t)(PIT_CAL_COUNT & 0xFF));
-    outb(PIT_CH2_DATA, (uint8_t)((PIT_CAL_COUNT >> 8) & 0xFF));
+    pit_oneshot_start(PIT_MS_TO_COUNT(CALIBRATION_MS));
 
     // Start the APIC timer with the maximum initial count
     lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
 
-    // Wait for PIT channel 2 to finish (bit 5 of port 0x61 goes high)
-    while (!(inb(PIT_GATE_PORT) & 0x20))
-        __asm__ volatile("pause");
+    while (!pit_oneshot_done())
+        cpu_relax();
 
     // Read how many APIC ticks elapsed
     uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
 
     // Stop the APIC timer
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
-
-    // Restore PIT gate
-    outb(PIT_GATE_PORT, gate);
+    pit_oneshot_stop();
 
     // Scale elapsed ticks to a per-second frequency
     uint32_t freq = elapsed * (1000 / CALIBRATION_MS);
@@ -165,11 +146,29 @@ static void error_handler(struct interrupt_frame *frame)
     lapic_eoi();
 }
 
-/// APIC spurious interrupt handler.
+/**
+ * @brief APIC spurious interrupt handler.
+ *
+ * A genuine spurious interrupt does not set an in-service bit, so it
+ * must not be acknowledged. Never send a fixed IPI on this vector: it
+ * @e would set the in-service bit, and without an EOI it would then block
+ * every interrupt on the target core.
+ */
 static void spurious_handler(struct interrupt_frame *frame)
 {
     (void)frame;
-    // don't send EOI
+}
+
+/**
+ * @brief Wake-up IPI handler.
+ *
+ * The IPI exists only to bring a core out of @c hlt; the woken core
+ * re-checks whatever condition it was waiting for.
+ */
+static void wake_handler(struct interrupt_frame *frame)
+{
+    (void)frame;
+    lapic_eoi();
 }
 
 // ── Local APIC timer API ───────────────────────────────────────────────
@@ -230,6 +229,12 @@ void lapic_send_ipi_all(uint8_t vector)
                 | LAPIC_ICR_DEST_OTHERS | LAPIC_ICR_LEVEL_ASSERT);
 }
 
+void lapic_send_nmi_all(void)
+{
+    lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_NMI | LAPIC_ICR_DEST_OTHERS
+                | LAPIC_ICR_LEVEL_ASSERT);
+}
+
 // ── Local APIC initialization ──────────────────────────────────────────────
 
 void lapic_init(void)
@@ -288,10 +293,12 @@ void lapic_init(void)
     idt_set_handler(APIC_ERROR_VECTOR, error_handler);
     lapic_write(LAPIC_LVT_ERROR, APIC_ERROR_VECTOR);
 
-    // Register spurious interrupt handler
+    // Register spurious and wake-up IPI handlers
     idt_set_handler(APIC_SPURIOUS_VECTOR, spurious_handler);
+    idt_set_handler(APIC_WAKE_VECTOR, wake_handler);
 
-    // Clear error status - writing twice ensures any latched errors are cleared
+    // Clear error status - writing twice ensures any latched errors
+    // are cleared
     lapic_write(LAPIC_ESR, 0);
     lapic_write(LAPIC_ESR, 0);
 
