@@ -111,9 +111,11 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
     pic_disable();
     lapic_init();
     ioapic_init(IOAPIC_BASE_PHYS_DEFAULT);
-    timer_init();
     tsc_init();
+    timer_init();
     kprintf("\n");
+
+    __asm__ volatile("sti");
 
     // ── v0.0.3 ──────────────────────────────────────────
     failures += test_interrupts();
