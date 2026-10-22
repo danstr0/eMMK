@@ -12,6 +12,7 @@
 
 #include "vmm.h"
 #include "pmm.h"
+#include "panic.h"
 #include "serial.h"
 #include "string.h"
 #include "spinlock.h"
@@ -315,9 +316,7 @@ void vmm_init(void)
     uint64_t pml4_phys = pmm_alloc_page_zero();
     if (pml4_phys == PMM_ALLOC_FAILED)
     {
-        kprintf("[VMM] FATAL: cannot allocate PML4\n");
-        for (;;)
-            __asm__ volatile("cli; hlt");
+        panic("[VMM] cannot allocate PML4");
     }
     kernel_pml4 = (pte_t *)pmm_phys_to_virt(pml4_phys);
 

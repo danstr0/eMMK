@@ -25,6 +25,7 @@
 
 #include "pmm.h"
 #include "multiboot2.h"
+#include "panic.h"
 #include "serial.h"
 #include "string.h"
 #include "spinlock.h"
@@ -237,10 +238,8 @@ void pmm_init(struct multiboot2_tag_mmap *mmap,
                                    mbi_start, mbi_end);
     if (pmm_bitmap_phys == 0)
     {
-        kprintf("[PMM] FATAL: no room for a %lu KiB bitmap below 1 GiB\n",
-                pmm_bitmap_size / 1024);
-        for (;;)
-            __asm__ volatile("cli; hlt");
+        panic("[PMM] no room for a %lu KiB bitmap below 1 GiB",
+              pmm_bitmap_size / 1024);
     }
     pmm_bitmap = (uint64_t *)BOOT_PHYS_TO_VIRT(pmm_bitmap_phys);
 
