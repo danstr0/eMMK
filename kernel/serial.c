@@ -134,16 +134,21 @@ static void serial_format_sink(void *ctx, char c)
     serial_put_translated((uint16_t)(uintptr_t)ctx, c);
 }
 
-void serial_printf(uint16_t port, const char *fmt, ...)
+void serial_vprintf(uint16_t port, const char *fmt, __builtin_va_list args)
 {
     uint64_t flags;
     bool locked = console_lock(&flags);
 
-    __builtin_va_list args;
-    __builtin_va_start(args, fmt);
     kvformat(serial_format_sink, (void *)(uintptr_t)port, fmt, args);
-    __builtin_va_end(args);
 
     console_unlock(locked, flags);
+}
+
+void serial_printf(uint16_t port, const char *fmt, ...)
+{
+    __builtin_va_list args;
+    __builtin_va_start(args, fmt);
+    serial_vprintf(port, fmt, args);
+    __builtin_va_end(args);
 }
 
