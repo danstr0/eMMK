@@ -1,16 +1,17 @@
 /**
  * @file timer.h
- * @brief Timer subsystem interface.
+ * @brief Kernel time API.
+ *
+ * All time is derived from the TSC (see tsc.h). There is no periodic
+ * timer interrupt: the kernel is tickless, so no core is ever interrupted
+ * to keep time, and reading the clock works with interrupts disabled.
  *
  * Provides:
- * - System tick counter driven by the APIC timer.
- * - Monotonic time conversions.
- * - Tick-based sleep functions.
+ * - Monotonic time since boot in ns / µs / ms.
+ * - A millisecond "tick" counter (@c TIMER_HZ = 1000) for code that
+ *   stores coarse timestamps (e.g., ARP cache ages).
+ * - Busy-wait sleeps.
  * - Deadline-based timeout helpers.
- *
- * The timer runs at @c TIMER_HZ ticks per second (default 1000 = 1 ms
- * resolution). Each tick increments a global counter via the APIC
- * timer interrupt handler.
  *
  * @warning On a run-to-completion kernel, all sleep / delay functions
  *          are busy-wait (polling) loops. Calling them blocks all
@@ -23,17 +24,15 @@
 #define EMMK_TIMER_H
 
 #include "types.h"
+#include "tsc.h"
 
 /// @name Configuration
 /// @{
 
 /**
- * @brief Timer interrupt frequency.
+ * @brief Resolution of the tick counter: 1000 ticks per second.
  *
- * 1000 Hz = 1 ms tick resolution.
- *
- * @note Higher values give finer granularity at the cost of more
- *       interrupt overhead per core.
+ * Ticks are derived from the TSC, not counted by an interrupt.
  */
 #define TIMER_HZ  1000
 /// @}
@@ -42,48 +41,49 @@
 /// @{
 
 /**
- * @brief Initialize the timer subsystem.
+ * @brief Initialize the time subsystem.
  *
- * Configures the APIC timer for periodic interrupts at @c TIMER_HZ
- * and calibrates the TSC for microsecond-precision delays.
- *
- * @pre @c lapic_init() and @c idt_init() must have been called.
- * @pre Interrupts must be enabled (the calibration routine waits for
- *      APIC timer ticks).
+ * @pre @c tsc_init() has run (it establishes time zero and the
+ *      conversion factors).
  */
 void timer_init(void);
 /// @}
 
-/// @name Tick counter
+/// @name Monotonic clock
 /// @{
+
+/// Nanoseconds since @c tsc_init().
+static inline uint64_t timer_get_ns(void)
+{
+    return tsc_cycles_to_ns(tsc_read() - tsc_get_boot());
+}
+
+/// Microseconds since @c tsc_init().
+static inline uint64_t timer_get_us(void)
+{
+    return tsc_cycles_to_us(tsc_read() - tsc_get_boot());
+}
+
+/// Milliseconds since @c tsc_init().
+static inline uint64_t timer_get_ms(void)
+{
+    return tsc_cycles_to_ms(tsc_read() - tsc_get_boot());
+}
 
 /**
  * @brief Read the monotonic tick counter.
  *
- * @return Number of timer interrupts since @c timer_init() was called.
- *
- * @note Wraps after ~584 million years at 1000 Hz (@c uint64_t).
+ * Kept for coarse timestamps; equal to @c timer_get_ms().
  */
-uint64_t timer_get_ticks(void);
-/// @}
-
-/// @name Time conversions
-/// @{
-
-/**
- * @brief Milliseconds elapsed since boot.
- *
- * For @c TIMER_HZ = 1000, this is identical to @c timer_get_ticks().
- */
-static inline uint64_t timer_get_ms(void)
+static inline uint64_t timer_get_ticks(void)
 {
-    return timer_get_ticks() * 1000 / TIMER_HZ;
+    return timer_get_ms();
 }
 
 /// Seconds since boot (truncated).
 static inline uint64_t timer_get_uptime(void)
 {
-    return timer_get_ticks() / TIMER_HZ;
+    return timer_get_ms() / 1000;
 }
 
 /// Convert a tick count to milliseconds.
@@ -106,21 +106,14 @@ static inline uint64_t timer_ms_to_ticks(uint64_t ms)
 /// @{
 
 /**
- * @brief Busy-wait for @p ticks timer interrupts.
+ * @brief Busy-wait for @p ticks ticks (milliseconds).
  *
- * @param ticks  Number of ticks to wait.
- *
- * @note Requires interrupts to be enabled — the tick counter is updated
- *       by the APIC timer interrupt handler. This function re-enables
- *       interrupts via @c sti if they are currently disabled.
+ * Spins on the TSC for the full duration (cycle resolution). Works with 
+ * interrupts disabled and never changes the interrupt flag.
  */
 void timer_sleep_ticks(uint64_t ticks);
 
-/**
- * @brief Busy-wait for @p ms milliseconds.
- *
- * @note Requires interrupts to be enabled.
- */
+/// Busy-wait for @p ms milliseconds (see @c timer_sleep_ticks).
 void timer_sleep_ms(uint64_t ms);
 /// @}
 
@@ -128,7 +121,7 @@ void timer_sleep_ms(uint64_t ms);
 /// @brief Non-blocking timeout checks for polling loops.
 ///
 /// Example:
-/// @code
+/// @code{.c}
 ///   uint64_t deadline = timer_deadline_ms(100); // 100 ms from now
 ///   while (!device_ready())
 ///   {
