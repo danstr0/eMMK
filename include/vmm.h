@@ -182,6 +182,27 @@ int vmm_map_pages(uint64_t vaddr, uint64_t paddr, size_t count, uint64_t flags);
 int vmm_map_range(uint64_t vaddr, uint64_t paddr, size_t size, uint64_t flags);
 
 /**
+ * @brief Allocate a kernel stack with a guard page below it.
+ *
+ * Maps @p size bytes (rounded up to pages) of fresh RW+NX memory in the
+ * stack window, leaving the page just below unmapped: overflowing the
+ * stack faults (#PF, which escalates to #DF on its IST stack) instead of
+ * silently overwriting whatever lies below. Frames are not physically
+ * contiguous. Stacks are never freed.
+ *
+ * @return The stack top (initial RSP), or @c 0 on failure.
+ */
+uint64_t vmm_alloc_stack(size_t size);
+
+/**
+ * @brief Remove the [4 KiB, 2 MiB) identity map.
+ *
+ * Called by @c smp_init() once every AP has left the trampoline.
+ * APs flush their own TLBs before running their roles.
+ */
+void vmm_unmap_identity(void);
+
+/**
  * @brief Map a device register region uncached into the MMIO window.
  *
  * Allocates fresh virtual space for every call (regions are never
