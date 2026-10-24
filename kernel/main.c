@@ -234,6 +234,8 @@ static NORETURN void bench_distributor_loop(int core_index)
  */
 NORETURN void kernel_main(struct multiboot2_info *mb_info)
 {
+    percpu_init(0, 0);
+
     serial_init(COM1_PORT, 115200);
 
 #ifdef KERNEL_TEST
@@ -309,7 +311,6 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     // ── TSS, per-CPU, and SMP ───────────────────────────
     kprintf("\n");
     tss_init();
-    percpu_init_bsp();
     idt_configure_ist();
     kprintf("\n");
     smp_init();

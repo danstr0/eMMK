@@ -14,6 +14,7 @@
 #include "tss.h"
 #include "smp.h"
 #include "apic.h"
+#include "vmm.h"
 
 uint32_t test_smp(void)
 {
@@ -28,6 +29,30 @@ uint32_t test_smp(void)
         TEST_ASSERT_EQ(p->core_index, 0, "BSP percpu core_index == 0");
         TEST_ASSERT_EQ(p->apic_id, (uint32_t)lapic_id(),
                        "percpu apic_id matches LAPIC");
+        TEST_ASSERT_EQ((uintptr_t)p, (uintptr_t)percpu_get(0),
+                       "percpu_get(0) is he BSP's area");
+        TEST_ASSERT_EQ((uintptr_t)p % CACHE_LINE_SIZE, 0,
+                       "percpu area cache-line aligned");
+        TEST_ASSERT((uintptr_t)percpu_get(1) - (uintptr_t)p
+                    >= CACHE_LINE_SIZE,
+                    "percpu areas on separate lines");
+    }
+
+    // ── Identity map removed after bring-up ─────────────
+    {
+        TEST_ASSERT(!vmm_is_mapped(AP_TRAMPOLINE_ADDR),
+                    "trampoline identity mapping removed");
+        TEST_ASSERT(!vmm_is_mapped(0x100000), "low identity map removed");
+    }
+
+    // ── Guard pages below IST stacks ────────────────────
+    {
+        struct tss *t = tss_get(0);
+        uint64_t ist1_base = t->ist1 - IST_STACK_SIZE;
+        TEST_ASSERT(vmm_is_mapped(t->ist1 - 8), "IST1 stack mapped");
+        TEST_ASSERT(vmm_is_mapped(ist1_base), "IST1 stack base mapped");
+        TEST_ASSERT(!vmm_is_mapped(ist1_base - PAGE_SIZE),
+                    "guard page below IST1 stack");
     }
 
     // ── this_core_id (GS-relative fast path) ────────────
@@ -98,6 +123,18 @@ uint32_t test_smp(void)
             TEST_ASSERT(t != NULL, "AP TSS non-NULL");
             TEST_ASSERT(t->ist1 != 0, "AP IST1 allocated");
             TEST_ASSERT(t->ist2 != 0, "AP IST2 allocated");
+
+            // Written by the AP itself in ap_entry()
+            struct percpu *p = percpu_get(i);
+            TEST_ASSERT_EQ((uintptr_t)p->self, (uintptr_t)p,
+                           "AP percpu self-pointer");
+            TEST_ASSERT_EQ(p->core_index, i, "AP percpu core_index");
+            TEST_ASSERT_EQ(p->apic_id, ci->apic_id, "AP percpu apic_id");
+
+            uint64_t sb = (uint64_t)ci->stack_base;
+            TEST_ASSERT(vmm_is_mapped(sb), "AP stack mapped");
+            TEST_ASSERT(!vmm_is_mapped(sb - PAGE_SIZE),
+                        "guard page below AP stack");
         }
 
         if (count > 1)

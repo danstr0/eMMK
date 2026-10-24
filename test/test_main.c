@@ -122,7 +122,6 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
 
     // ── Initialize TSS, per-CPU, and SMP ────────────────
     tss_init();
-    percpu_init_bsp();
     idt_configure_ist();
     smp_init();
     kprintf("\n");

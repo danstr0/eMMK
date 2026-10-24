@@ -4,20 +4,20 @@ Task State Segment (TSS) & Per-CPU Subsystem
 
 Overview
 ========
-
 In eMMK's 64-bit SMP architecture, CPU core isolation relies on two
 low-level hardware/software constructs:
 
 1. **Task State Segment (TSS):** Dedicated per-core hardware structures
    required by long mode for stack switching during interrupts, critical
    exceptions (via IST), and privilege changes.
-2. **Per-CPU Data Areas (struct percpu):** Heap-allocated structures bound
-   to each physical CPU core using the x86-64 ``GS`` segment base MSR
-   (``MSR_GS_BASE`` = ``0xC0000101``).
+2. **Per-CPU Data Areas (struct percpu):** A static, cache-line-aligned
+   array of structures, one bound to each core through the x86-64 ``GS``
+   segment base MSR (``MSR_GS_BASE`` = ``0xC0000101``).
 
 Because eMMK operates exclusively in Ring 0 with a single flat address
 space, these subsystems are optimized for zero-overhead access, eschewing
 user-space switching mechanics like ``SWAPGS``.
+
 
 Task State Segment (TSS) & Runtime GDT
 ======================================
@@ -63,8 +63,9 @@ assertion:
 
 IST Allocation Policy
 ~~~~~~~~~~~~~~~~~~~~~
-Each core dynamically allocates two independent 8 KiB (2-page) stacks from
-the Physical Memory Manager (PMM) during initialization:
+Each core allocates two independent 8 KiB stacks with ``vmm_alloc_stack()``
+during initialization. They reside in the stack window, each with an
+unmapped guard page below it (see :doc:`memory/memory_layout`):
 
 * **IST1** (``IST_DOUBLE_FAULT``): Dedicated stack for vector 8 (``#DF``).
   Prevents kernel panics from escalating to triple faults when kernel
@@ -140,18 +141,39 @@ both low and high quads:
   (``0x9`` = 64-bit Available TSS), Present flag (``P=1``), DPL=0.
 * **High 64-bits:** Base[63:32] in bits [31:0]; top 32 bits reserved.
 
+
 Per-CPU Architecture (``struct percpu``)
 ========================================
 
 Hardware Mechanism (GS Base)
 ----------------------------
 eMMK leverages the x86-64 ``MSR_GS_BASE`` (``0xC0000101``) model for
-per-core variables. During initialization, the model-specific register on
-each core is written with the virtual address of that core's heap-allocated
-``struct percpu``.
+per-core variables. Each core writes the address of its own entry in the
+static ``percpu_areas[SMP_MAX_CORES]`` array into the MSR.
 
 Because eMMK runs purely in kernel space, no user-space context switches
 occur, removing the need to execute ``SWAPGS``.
+
+.. warning::
+
+   In 64-bit mode, loading a selector into GS (``mov %ax, %gs``) also
+   resets the GS base from the descriptor (to 0). Code that reloads
+   segment registers after ``percpu_init()`` (``tss_init``, ``ap_entry``)
+   must skip GS.
+
+Static, Early, Cache-Line Aligned
+---------------------------------
+The areas are a static array rather than heap allocations:
+
+- **Available from the first instruction:** The BSP calls
+  ``percpu_init(0, 0)`` as the first statement of ``kernel_main()``; each
+  AP calls ``percpu_init()`` at the top of ``ap_entry()`` with the core
+  index the BSP passed it. ``this_core_id()`` is therefore valid
+  everywhere.
+- **No false sharing:** ``struct percpu`` is ``CACHE_ALIGNED``; two cores'
+  areas never share a cache line. The heap-allocated version was 40 bytes
+  with 16-byte alignment, so neighbors shared lines.
+- **No failure path:** Nothing to allocate.
 
 Self-Referential Pointer Pattern
 --------------------------------
@@ -163,12 +185,11 @@ itself:
 
    struct percpu
    {
-       struct percpu *self;       // %gs:0 points here
-       int            core_index;
+       struct percpu *self;        // %gs:0 points here
+       int            core_index;  // %gs:8
        uint32_t       apic_id;
        struct tss    *tss;
-       uint64_t       rsp0;
-   };
+   } CACHE_ALIGNED;
 
 Dereferencing `%gs:0`
 ~~~~~~~~~~~~~~~~~~~~~
@@ -187,7 +208,12 @@ computes the member offset at compile time using ``__builtin_offsetof``:
 
 .. code-block:: asm
 
-   movl %gs:4, %eax   ; Reads core_index directly without materializing `self`
+   movl %gs:8, %eax   ; Reads core_index directly without materializing `self`
+
+The accessors are *non-volatile* inline asm: a core's GS base never
+changes after ``percpu_init()``, so the compiler may reuse a loaded value
+instead of re-reading ``%gs``.
+
 
 Initialization Lifecycle
 ========================
@@ -200,36 +226,34 @@ Boot Sequence Flow
    [ BSP Initialization (kernel_main) ]
                    │
                    ▼
-      1. pmm_init() / heap_init()
+      1. percpu_init(0, 0)
+         └── wrmsr(MSR_GS_BASE, &percpu_areas[0])
                    │
                    ▼
-      2. tss_init()
+      2. pmm / vmm / heap / slab, interrupts, TSC
+                   │
+                   ▼
+      3. tss_init()
          ├── Constructs runtime_gdt[]
-         ├── Allocates IST1/IST2 for Core 0
+         ├── Allocates guarded IST1/IST2 for Core 0
          ├── Populates TSS Slot 3-4
-         ├── Executing lgdt + segment reload
-         └── Executing ltr (Selector 0x18)
-                   │
-                   ▼
-      3. percpu_init_bsp()
-         ├── kzalloc(sizeof(struct percpu))
-         ├── Binds core_index=0, LAPIC ID
-         └── wrmsr(MSR_GS_BASE, &bsp_percpu)
+         ├── lgdt + reload CS, DS, ES, FS, SS (not GS)
+         └── ltr (Selector 0x18)
                    │
                    ▼
       4. smp_init()  ──► [ AP Core Initialization (ap_entry) ]
-                                      │
+         └── percpu_set_apic_id()     │
                                       ▼
-                         1. tss_init_ap(core_index, stack_top)
-                            ├── Allocates IST1/IST2 for AP
+                         1. cpu_init_core()
+                         2. percpu_init(core_index, apic_id)
+                            └── values from the trampoline parameter block
+                         3. segments, IDT, LAPIC
+                         4. tss_init_ap(core_index, stack_top)
+                            ├── Allocates guarded IST1/IST2 for AP
                             ├── Populates TSS Descriptor
-                            ├── Executing lgdt (runtime_gdt_ptr)
-                            └── Executing ltr (TSS_SELECTOR(index))
-                                      │
-                                      ▼
-                         2. percpu_init_ap(core_index, apic_id)
-                            ├── kzalloc(sizeof(struct percpu))
-                            └── wrmsr(MSR_GS_BASE, &ap_percpu)
+                            ├── lgdt (runtime_gdt_ptr)
+                            └── ltr (TSS_SELECTOR(index))
+
 
 Core API Reference
 ==================
@@ -258,15 +282,20 @@ TSS Functions
 Per-CPU Functions & Accessors
 -----------------------------
 
-.. c:function:: void percpu_init_bsp(void)
+.. c:function:: void percpu_init(int core_index, uint32_t apic_id)
 
-   Allocates and installs the BSP's ``struct percpu`` block and writes its
-   address to ``MSR_GS_BASE``. Must be called after ``heap_init()``.
+   Fills in ``percpu_areas[core_index]`` and points the calling core's
+   ``MSR_GS_BASE`` at it. Needs nothing else initialized.
 
-.. c:function:: void percpu_init_ap(int core_index, uint32_t apic_id)
+.. c:function:: void percpu_set_apic_id(uint32_t apic_id)
 
-   Allocates and installs an AP's ``struct percpu`` instance and sets its
-   local ``MSR_GS_BASE``.
+   Updates the calling core's recorded APIC ID (used by ``smp_init()``
+   for the BSP).
+
+.. c:function:: struct percpu *percpu_get(int core_index)
+
+   Another core's area (or ``NULL`` if out range), for cross-core
+   inspection.
 
 .. c:function:: static inline struct percpu *this_cpu(void)
 
@@ -293,8 +322,8 @@ References
 Related Files
 =============
 
-- ``include/tss.h``
-- ``kernel/tss.c``
-- ``include/percpu.h``
-- ``kernel/percpu.c``
+- ``include/tss.h`` / ``kernel/tss.c``
+- ``include/percpu.h`` /  ``kernel/percpu.c``
+- ``include/cpu.h``
+- ``test/test_smp.c``
 

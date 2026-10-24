@@ -4,6 +4,7 @@
  */
 
 #include "apic.h"
+#include "cpu.h"
 #include "vmm.h"
 #include "io.h"
 #include "pit.h"
@@ -11,31 +12,13 @@
 #include "idt.h"
 #include "pic.h"
 
-// ── MSR helpers ────────────────────────────────────────────────────────
-
-static inline uint64_t rdmsr(uint32_t msr)
-{
-    uint32_t low, high;
-    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
-    return ((uint64_t)high << 32) | low;
-}
-
-static inline void wrmsr(uint32_t msr, uint64_t value)
-{
-    uint32_t low  = (uint32_t)(value & 0xFFFFFFFF);
-    uint32_t high = (uint32_t)(value >> 32);
-    __asm__ volatile("wrmsr" : : "a"(low), "d"(high), "c"(msr));
-}
-
 // ── CPUID detection ────────────────────────────────────────────────────
 
 /// Check CPUID.01H:EDX bit 9 (APIC on-chip).
 static bool apic_available(void)
 {
     uint32_t eax, ebx, ecx, edx;
-    __asm__ volatile("cpuid"
-                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                     : "a"(1));
+    cpuid(1, &eax, &ebx, &ecx, &edx);
     return (edx & (1 << 9)) != 0;
 }
 

@@ -3,22 +3,23 @@
  * @brief SMP initialization — AP discovery and startup.
  *
  * @par Core discovery
- * For QEMU, the number of cores is detected by sending a broadcast
- * SIPI and counting responses. On real hardware this would come from
- * the ACPI MADT.
+ * The number of logical processors is taken from CPUID leaf 1
+ * (EBX[23:16]) and APIC IDs are assumed to be 0, 1, 2, ... (true on
+ * QEMU). TODO: revisit with real-hardware update.
  *
- * @par APIC ID → core index mapping
- * QEMU assigns sequential APIC IDs starting from 0. The BSP is always
- * APIC ID 0 = core index 0. This assumption is documented and sufficient
- * for the QEMU target.
+ * @par Core indices
+ * Core indices are dense: 0 is the BSP, and each AP that starts
+ * successfully gets the next index. An AP that fails to report in is sent
+ * an INIT IPI (parking it in wait-for-SIPI) so that it cannot wake up
+ * later on an index that has been given to another core.
  */
 
 #include "smp.h"
 #include "apic.h"
+#include "cpu.h"
 #include "idt.h"
 #include "tss.h"
 #include "percpu.h"
-#include "pmm.h"
 #include "vmm.h"
 #include "serial.h"
 #include "string.h"
@@ -27,13 +28,14 @@
 
 // ── Trampoline symbols (from ap_trampoline.asm) ────────────────────────
 
+// Physical-address symbols (VMA == LMA); access through the kernel image
+// mapping (+ KERNEL_VIRTUAL_BASE)
 extern uint8_t ap_trampoline_start[];
 extern uint8_t ap_trampoline_end[];
 
 // ── GDT symbols (from multiboot2.asm, used by APs) ─────────────────────
 
-extern uint8_t gdt64[];
-extern uint8_t gdt64_pointer[];  // 10-byte LGDT operand
+extern uint8_t gdt64_pointer[];  // 10-byte LGDT operand (physical symbol)
 
 // ── Global state ───────────────────────────────────────────────────────
 
@@ -43,36 +45,14 @@ static int              core_count = 0;
 /// The parameter block in the trampoline page (virtual address).
 static volatile struct ap_boot_params *ap_params;
 
+/// Kernel-image alias of a physical-address boot symbol.
+#define IMAGE_ALIAS(sym)  ((void *)((uintptr_t)(sym) + KERNEL_VIRTUAL_BASE))
+
 // ── Core identification ────────────────────────────────────────────────
 
 int smp_get_core_count(void)
 {
     return core_count;
-}
-
-int smp_core_id(void)
-{
-    // Fast path: if the per-CPU area has been initialized (GS base is
-    // set), read the core index directly from %gs. This is a single
-    // mov instruction with no LAPIC read or loop.
-    uint32_t lo, hi;
-    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_GS_BASE));
-    uint64_t gs_base = ((uint64_t)hi << 32) | lo;
-
-    if (gs_base != 0)
-        return this_core_id();
-
-    // Before SMP init, only BSP is running
-    if (core_count == 0)
-        return 0;
-
-    // Fallback: scan by APIC ID
-    uint32_t id = lapic_id();
-    for (int i = 0; i < core_count; ++i)
-        if (cores[i].apic_id == id)
-            return i;
-
-    return 0;
 }
 
 struct core_info *smp_get_core(int index)
@@ -82,40 +62,25 @@ struct core_info *smp_get_core(int index)
     return &cores[index];
 }
 
-// ── Per-AP stack allocation ────────────────────────────────────────────
-
-/**
- * @brief Allocate a stack for an AP.
- * @return Virtual address of the stack top, or @c 0 on failure.
- */
-static uint64_t alloc_ap_stack(void)
-{
-    size_t pages = AP_STACK_SIZE / PAGE_SIZE;
-    uint64_t phys = pmm_alloc_pages(pages);
-    if (phys == PMM_ALLOC_FAILED)
-        return 0;
-    return (uint64_t)PHYS_TO_VIRT(phys) + AP_STACK_SIZE;
-}
-
 // ── Trampoline setup ───────────────────────────────────────────────────
 
 /**
- * @brief Copy the trampoline and write boot parameters.
+ * @brief Copy the trampoline and write the shared boot parameters.
  *
  * The trampoline code is position-dependent on @c AP_TRAMPOLINE_ADDR.
- * The parameter lock is at offset @c AP_PARAMS_OFFSET within the
+ * The parameter block is at offset @c AP_PARAMS_OFFSET within the
  * same page.
  */
 static void setup_trampoline(void)
 {
     size_t tramp_size = (size_t)(ap_trampoline_end - ap_trampoline_start);
 
-    // The trampoline physical address is identity-mapped
+    // Write the trampoline page through the direct map
     uint8_t *dest = (uint8_t *)PHYS_TO_VIRT(AP_TRAMPOLINE_ADDR);
 
     // Zero the whole page first, then copy the trampoline code
     memset(dest, 0, PAGE_SIZE);
-    memcpy(dest, ap_trampoline_start, tramp_size);
+    memcpy(dest, IMAGE_ALIAS(ap_trampoline_start), tramp_size);
 
     // Set up the parameter block pointer
     ap_params = (volatile struct ap_boot_params *)
@@ -124,46 +89,55 @@ static void setup_trampoline(void)
     // PML4: read from the BSP's CR3
     ap_params->pml4_addr = (uint32_t)vmm_get_pml4();
 
-    // GDT: the 64-bit GDT defined in multiboot2.asm. The APs need
-    // both the base address and the limit. The BSP has already loaded
-    // this GDT; extract the values from the LGDT operand.
-    uint16_t *gdt_ptr_limit = (uint16_t *)gdt64_pointer;
-    uint64_t *gdt_ptr_base  = (uint64_t *)(gdt64_pointer + 2);
+    // GDT: the boot GDT from multiboot2.asm (null, code, data). It sbase
+    // is a physical address, reachable through the identity map while
+    // the AP is in compatibility mode. ap_entry switches to the runtime
+    // GDT (tss_init_ap) before the identity map is removed.
+    const uint8_t *gdt_ptr = IMAGE_ALIAS(gdt64_pointer);
+    uint16_t gdt_limit = *(const uint16_t *)gdt_ptr;
+    uint64_t gdt_base  = *(const uint64_t *)(gdt_ptr + 2);
 
-    ap_params->gdt_limit    = *gdt_ptr_limit;
-    ap_params->gdt_ptr_low  = (uint32_t)(*gdt_ptr_base & 0xFFFFFFFF);
-    ap_params->gdt_ptr_high = (uint32_t)(*gdt_ptr_base >> 32);
+    ap_params->gdt_limit    = gdt_limit;
+    ap_params->gdt_ptr_low  = (uint32_t)(gdt_base & 0xFFFFFFFF);
+    ap_params->gdt_ptr_high = (uint32_t)(gdt_base >> 32);
 
     ap_params->entry_point = (uint64_t)ap_entry;
 
-    kprintf("[SMP] Trampoline at phys 0x%lx, size %lu bytes\n",
-            (uint64_t)AP_TRAMPOLINE_ADDR, (uint64_t)tramp_size);
+    kprintf("[SMP] Trampoline at phys 0x%lx, size %zu bytes\n",
+            (uint64_t)AP_TRAMPOLINE_ADDR, tramp_size);
 }
 
 // ── AP startup (INIT-SIPI-SIPI) ────────────────────────────────────────
 
+/// Send an INIT IPI to @p apic_id (resets it into wait-for-SIPI).
+static void send_init(uint32_t apic_id)
+{
+    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_ASSERT);
+}
+
 /**
  * @brief Start a single AP.
  *
- * @param apic_id  Target AP's Local APIC ID.
- * @param stack    Virtual address of the AP's stack top.
+ * @param apic_id     Target AP's Local APIC ID.
+ * @param core_index  Core index the AP will take.
+ * @param stack       Virtual address of the AP's stack top.
  * @return @c true if the AP reported ready within the timeout.
  */
-static bool start_ap(uint32_t apic_id, uint64_t stack)
+static bool start_ap(uint32_t apic_id, int core_index, uint64_t stack)
 {
     // Write per-AP parameters
-    ap_params->stack_top = stack;
-    ap_params->ap_ready  = 0;
-    ap_params->ap_id     = apic_id;
+    ap_params->stack_top  = stack;
+    ap_params->ap_ready   = 0;
+    ap_params->ap_id      = apic_id;
+    ap_params->core_index = (uint32_t)core_index;
 
     // Ensure writes are visible before sending IPIs
     barrier();
 
     // INIT IPI: resets the AP to its power-on state.
     // Intel SDM Vol. 3, §11.4.7.3.
-    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-    lapic_write(LAPIC_ICR_LOW,
-                LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_ASSERT);
+    send_init(apic_id);
 
     timer_sleep_ms(10);
 
@@ -188,7 +162,10 @@ static bool start_ap(uint32_t apic_id, uint64_t stack)
     {
         if (timer_deadline_expired(deadline))
         {
-            kprintf("[SMP] AP %lu failed to start (timeout)\n",
+            // Park it: a late AP must not run on an index that the next
+            // AP is about to be given.
+            send_init(apic_id);
+            kprintf("[SMP] AP %lu failed to start (timeout); parked\n",
                     (uint64_t)apic_id);
             return false;
         }
@@ -203,10 +180,22 @@ static bool start_ap(uint32_t apic_id, uint64_t stack)
 NORETURN void ap_entry(void)
 {
     // At this point:
-    // - In 64-bit long mode with a fresh per-AP stack
+    // - In 64-bit long mode on the per-AP stack
     // - CR3 points to the BSP's page tables
-    // - The BSP's runtime GDT is loaded (via the trampoline)
-    // - No LAPIC enabled yet, no TSS, no per-CPU area
+    // - The boot GDT is loaded (via the trampoline); no IDT, TSS, LAPIC
+    //   setup, or per-CPU area yet
+    //
+    // The BSP waits for ap_ready before touching ap_params again, so the
+    // parameters below are stable
+
+    // Control registers first, then the per-CPU area, so that
+    // this_core_id() is valid for everything that follows
+    cpu_init_core();
+
+    int      my_core = (int)ap_params->core_index;
+    uint32_t my_id = ap_params->ap_id;
+    uint64_t my_stack = ap_params->stack_top;
+    percpu_init(my_core, my_id);
 
     // Reload segment registers
     __asm__ volatile(
@@ -217,7 +206,6 @@ NORETURN void ap_entry(void)
         "mov %%ax, %%ss\n"
         ::: "ax"
     );
-    // GS is set later by percpu_init_ap via wrmsr
 
     // Load the IDT (same table as the BSP)
     extern struct idt_entry idt[];
@@ -241,42 +229,28 @@ NORETURN void ap_entry(void)
     lapic_write(LAPIC_ESR, 0);
     lapic_eoi();
 
-    // Read our APIC ID and find our core index
-    uint32_t my_id = lapic_id();
-    int my_core = -1;
-    for (int i = 0; i < SMP_MAX_CORES; ++i)
-        if (cores[i].apic_id == my_id)
-        {
-            my_core = i;
-            break;
-        }
-
-    // Install per-core TSS and load the Task Register
-    if (my_core >= 0)
-        tss_init_ap(my_core,
-                    (uint64_t)cores[my_core].stack_base + AP_STACK_SIZE);
-
-    // Set up the per-CPU area (sets GS base)
-    if (my_core >= 0)
-        percpu_init_ap(my_core, my_id);
+    // Install per-core TSS (IST stacks) and switch to the runtime GDT
+    tss_init_ap(my_core, my_stack);
 
     // Enable interrupts on this core
     __asm__ volatile("sti");
 
-    kprintf("[SMP] AP %lu online (core %d)\n",
-            (uint64_t)my_id, my_core);
+    kprintf("[SMP] AP %lu online (core %d)\n", (uint64_t)my_id, my_core);
 
     // Signal the BSP that we're ready
-    if (my_core >= 0)
-        cores[my_core].online = true;
-    ap_params->ap_ready = 1;
+    cores[my_core].online = true;
     barrier();
+    ap_params->ap_ready = 1;
 
     // Wait for the BSP to assign a role and launch
     __asm__ volatile("cli");
     while (!cores[my_core].launched)
         __asm__ volatile("sti; hlt; cli" ::: "memory");
     __asm__ volatile("sti");
+
+    // The BSP removed the identity map after smp_init(); drop any
+    // translations this core still caches from the trampoline
+    vmm_flush_tlb_all();
 
     if (cores[my_core].run_func)
     {
@@ -306,14 +280,13 @@ int smp_init(void)
     cores[0].online  = true;
     cores[0].is_bsp  = true;
     core_count = 1;
+    percpu_set_apic_id(cores[0].apic_id);
 
     kprintf("[SMP] BSP: APIC ID %lu\n", (uint64_t)cores[0].apic_id);
 
-    // Determine how many APs exist
+    // Determine how many APs exist. TODO: ACPI MADT
     uint32_t eax, ebx, ecx, edx;
-    __asm__ volatile("cpuid"
-                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                     : "a"(1));
+    cpuid(1, &eax, &ebx, &ecx, &edx);
     int max_cores = (ebx >> 16) & 0xFF;
     if (max_cores < 1)
         max_cores = 1;
@@ -325,6 +298,7 @@ int smp_init(void)
     if (max_cores <= 1)
     {
         kprintf("[SMP] Single-core system - no APs to start\n");
+        vmm_unmap_identity();
         return 0;
     }
 
@@ -335,10 +309,11 @@ int smp_init(void)
     int aps_started = 0;
     for (int i = 1; i < max_cores; ++i)
     {
-        uint32_t ap_apic_id = (uint32_t)i;  // QEMU: sequential IDs
+        uint32_t ap_apic_id = (uint32_t)i;  // TODO: from the MADT
+        int      index      = core_count;
 
-        // Allocate a stack for this AP
-        uint64_t stack = alloc_ap_stack();
+        // Allocate a guarded stack for this AP
+        uint64_t stack = vmm_alloc_stack(AP_STACK_SIZE);
         if (stack == 0)
         {
             kprintf("[SMP] Failed to allocate stack for AP %d\n", i);
@@ -346,22 +321,26 @@ int smp_init(void)
         }
 
         // Pre-register the core so ap_entry() can find itself
-        cores[i].apic_id    = ap_apic_id;
-        cores[i].online     = false;
-        cores[i].is_bsp     = false;
-        cores[i].stack_base = (void *)(stack - AP_STACK_SIZE);
+        memset(&cores[index], 0, sizeof(cores[index]));
+        cores[index].apic_id    = ap_apic_id;
+        cores[index].stack_base = (void *)(stack - AP_STACK_SIZE);
 
-        if (start_ap(ap_apic_id, stack))
+        if (start_ap(ap_apic_id, index, stack))
         {
             core_count++;
             aps_started++;
             kprintf("[SMP] AP %lu started successfully\n",
                     (uint64_t)ap_apic_id);
         }
+        else
+            memset(&cores[index], 0, sizeof(cores[index]));
     }
 
     kprintf("[SMP] %d AP(s) started, %d total core(s) online\n",
             aps_started, core_count);
+
+    // Every AP is now past the trampoline and on the runtime GDT
+    vmm_unmap_identity();
 
     return aps_started;
 }

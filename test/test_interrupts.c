@@ -10,6 +10,7 @@
 #include "test.h"
 #include "idt.h"
 #include "apic.h"
+#include "cpu.h"
 #include "timer.h"
 #include "tsc.h"
 
@@ -30,6 +31,38 @@ static void test_ipi_handler(struct interrupt_frame *frame)
     (void)frame;
     test_ipi_count++;
     lapic_eoi();
+}
+
+static volatile uint64_t recover_rip;
+static volatile int      pf_count;
+static volatile uint64_t pf_addr;
+
+/// A read-only object in .rodata to write to.
+static const volatile uint8_t ro_target = 0x11;
+
+/// #PF handler for tests: record the fault and resume at recover_rip.
+static void test_pf_handler(struct interrupt_frame *frame)
+{
+    uint64_t cr2;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    pf_addr = cr2;
+    pf_count++;
+    frame->rip = recover_rip;
+}
+
+/// Store one byte at @p p; @return @c true if the store page-faulted.
+static bool store_faults(volatile uint8_t *p)
+{
+    int before = pf_count;
+    __asm__ volatile(
+        "leaq 1f(%%rip), %%rax\n\t"
+        "movq %%rax, %0\n\t"
+        "movb $0x5a, (%1)\n\t"
+        "1:\n\t"
+        : "=m"(recover_rip)
+        : "r"(p)
+        : "rax", "memory");
+    return pf_count != before;
 }
 
 /// @return @c true if RFLAGS.IF is set.
@@ -139,6 +172,20 @@ uint32_t test_interrupts(void)
                        "interrupts still delivered after a wake IPI");
     
         idt_set_handler(TEST_IPI_VECTOR, NULL);
+    }
+
+    // ── Read-only pages are enforced in ring 0 (CR0.WP)
+    {
+        TEST_ASSERT(read_cr0() & CR0_WP, "CR0.WP set");
+
+        idt_set_handler(EXCEPTION_PF, test_pf_handler);
+        bool faulted = store_faults((volatile uint8_t *)&ro_target);
+        idt_set_handler(EXCEPTION_PF, NULL);
+
+        TEST_ASSERT(faulted, "store to .rodata page-faults");
+        TEST_ASSERT_EQ(pf_addr, (uint64_t)&ro_target,
+                       "fault address is the .rodata object");
+        TEST_ASSERT_EQ(ro_target, 0x11, ".rodata value unchanged");
     }
 
     // ── Deadline helpers ────────────────────────────────

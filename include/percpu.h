@@ -3,31 +3,35 @@
  * @brief Per-CPU data area.
  *
  * Each CPU core has a private @c percpu instance, accessible at zero
- * cost via the GS segment base register. On x86-64, the @c MSR_GS_BASE
- * MSR is set during core init to point to the core's percpu struct;
- * reading @c %gs:offset then gives direct access without any table
+ * cost via the GS segment base register: @c MSR_GS_BASE points at the
+ * core's struct, so @c %gs:offset reads a field directly with no table
  * lookup.
  *
  * @par Accessing per-CPU data
- * @code
+ * @code{.c}
  *   struct percpu *p = this_cpu();
- *   int id = p->core_index;
+ *   int id = this_core_id();        // one instruction: movl %gs:8, %eax
  * @endcode
+ *
+ * @par Lifetime
+ * The areas are a static, cache-line-aligned array (one per possible
+ * core), so they need no allocator and exist from the first instruction.
+ * Each core installs its own as the very first thing it does: the BSP at
+ * the top of @c kernel_main(), each AP at the top of @c ap_entry(). From
+ * then on @c this_core_id() is valid everywhere, including in the slab
+ * allocator's fast path an in exception handlers.
  *
  * @par Why GS and not FS?
  * The Linux kernel uses GS for per-CPU data in kernel mode. Since eMMK
  * has no userland (and no SWAPGS), GS base is set directly via @c wrmsr
  * and FS is left unused.
- *
- * @note The @c percpu struct is allocated from the heap during core init.
- *       The BSP's percpu is set up during @c percpu_init_bsp(); each
- *       AP's is set up during @c percpu_init_ap().
  */
 
 #ifndef EMMK_PERCPU_H
 #define EMMK_PERCPU_H
 
 #include "types.h"
+#include "kernel.h"
 #include "tss.h"
 
 /// MSR for the GS segment base address.
@@ -41,8 +45,9 @@
  *
  * The @c self pointer must be the first field — @c this_cpu() reads
  * @c %gs:0 and expects to get a pointer back to the struct itself.
- * This allows a single instruction to load the @c percpu pointer from
- * any context.
+ *
+ * Cache-line aligned so that no two cores' areas share a line: fields a
+ * core writes for itself never invalidate another core's cache.
  */
 struct percpu
 {
@@ -50,64 +55,62 @@ struct percpu
     int            core_index;  ///< Core number (0 = BSP).
     uint32_t       apic_id;     ///< Local APIC ID.
     struct tss    *tss;         ///< This core's TSS.
-    uint64_t       rsp0;        ///< Kernel stack top (for RSP0 in TSS).
     // Future per-core fields
-};
+} CACHE_ALIGNED;
 /// @}
 
-/// @name Accessor
+/// @name Accessors
 /// @{
 
 /**
  * @brief Get the current core's @c percpu pointer.
  *
- * Reads @c %gs:0, which contains @c percpu->self (a pointer back to
- * the struct). This compiles to a single @c mov instruction.
+ * Reads @c %gs:0, which contains @c percpu->self.
  */
 static inline struct percpu *this_cpu(void)
 {
     struct percpu *p;
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(p));
+    __asm__("movq %%gs:0, %0" : "=r"(p));
     return p;
 }
 
 /**
  * @brief Get the current core's index (0 = BSP).
  *
- * Slightly cheaper than @c this_cpu()->core_index because it reads
- * directly from the GS-relative offset without materializing the
- * full pointer.
+ * Reads the field directly from its GS-relative offset.
  */
 static inline int this_core_id(void)
 {
     int id;
-    __asm__ volatile("movl %%gs:%c1, %0"
-                     : "=r"(id)
-                     : "i"(__builtin_offsetof(struct percpu, core_index)));
+    __asm__ ("movl %%gs:%c1, %0"
+             : "=r"(id)
+             : "i"(__builtin_offsetof(struct percpu, core_index)));
     return id;
 }
 /// @}
 
-/// @name Initialization
+/// @name Initialization and cross-core access
 /// @{
 
 /**
- * @brief Allocate and install the BSP's @c percpu area.
+ * @brief Install the per-CPU area for the calling core.
  *
- * Must be called after @c heap_init() and before @c smp_init().
- * Sets up the GS base for core 0.
+ * Fills in @c percpu[core_index] and points @c MSR_GS_BASE at it. Needs
+ * no allocator, LAPIC, or other subsystem.
+ *
+ * @param core_index  Core number (0 = BSP).
+ * @param apic_id     Local APIC ID.
  */
-void percpu_init_bsp(void);
+void percpu_init(int core_index, uint32_t apic_id);
+
+/// Update the calling core's recorded APIC ID.
+void percpu_set_apic_id(uint32_t apic_id);
 
 /**
- * @brief Allocate and install an AP's percpu area.
- *
- * Called from @c ap_entry() on each Application Processor.
- *
- * @param core_index  The AP's core index.
- * @param apic_id     The AP's Local APIC ID.
+ * @brief Another core's per-CPU area.
+ * @return Pointer to core @p core_index's area, or @c NULL if out of range.
  */
-void percpu_init_ap(int core_index, uint32_t apic_id);
+struct percpu *percpu_get(int core_index);
 /// @}
 
 #endif // EMMK_PERCPU_H

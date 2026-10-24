@@ -9,9 +9,7 @@
  */
 
 #include "tss.h"
-#include "smp.h"
-#include "pmm.h"
-#include "heap.h"
+#include "vmm.h"
 #include "serial.h"
 #include "string.h"
 
@@ -86,16 +84,12 @@ static void gdt_write_tss_descriptor(int slot, uint64_t tss_addr,
 // ── IST stack allocation ───────────────────────────────────────────────
 
 /**
- * @brief Allocate a stack for an IST entry.
+ * @brief Allocate a stack for an IST entryi (with a guard page below).
  * @return Virtual address of the stack top, or @c 0 on failure.
  */
 static uint64_t alloc_ist_stack(void)
 {
-    size_t pages = IST_STACK_SIZE / PAGE_SIZE;
-    uint64_t phys = pmm_alloc_pages(pages);
-    if (phys == PMM_ALLOC_FAILED)
-        return 0;
-    return (uint64_t)PHYS_TO_VIRT(phys) + IST_STACK_SIZE;
+    return vmm_alloc_stack(IST_STACK_SIZE);
 }
 
 // ── Per-core TSS setup ─────────────────────────────────────────────────
@@ -145,12 +139,14 @@ void tss_init(void)
     kprintf("[TSS] Building runtime GDT...\n");
 
     // Copy the boot GDT's base entries (null, code, data)
-    extern uint64_t gdt64[];  // from multiboot2.asm
+    extern char gdt64[];
+    const uint64_t *boot_gdt = (const uint64_t *)
+                               ((uintptr_t)gdt64 + KERNEL_VIRTUAL_BASE);
 
     memset(runtime_gdt, 0, sizeof(runtime_gdt));
-    runtime_gdt[0] = gdt64[0];  // null
-    runtime_gdt[1] = gdt64[1];  // 64-bit code
-    runtime_gdt[2] = gdt64[2];  // 64-bit data
+    runtime_gdt[0] = boot_gdt[0];  // null
+    runtime_gdt[1] = boot_gdt[1];  // 64-bit code
+    runtime_gdt[2] = boot_gdt[2];  // 64-bit data
 
     // Set up the BSP's TSS (core 0)
     // stack_top (entry64.asm) is a physical-address symbol; the BSP runs
@@ -177,7 +173,6 @@ void tss_init(void)
             "mov %%ax, %%ds\n"
             "mov %%ax, %%es\n"
             "mov %%ax, %%fs\n"
-            "mov %%ax, %%gs\n"
             "mov %%ax, %%ss\n"
             ::: "rax", "memory"
     );

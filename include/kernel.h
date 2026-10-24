@@ -18,6 +18,7 @@
  *   0x0000_0000_0000_1000 .. 0x0000_0000_001F_FFFF  Identity map
  *   0xFFFF_8000_0000_0000 .. +RAM                   Direct map of all RAM
  *   0xFFFF_C000_0000_0000 .. +HEAP_MAX_SIZE         Kernel heap
+ *   0xFFFF_D000_0000_0000 .. +512 GiB               Guarded stacks
  *   0xFFFF_E000_0000_0000 .. +512 GiB               MMIO window (UC)
  *   0xFFFF_FFFF_8000_0000 .. +image                 Kernel image (-2 GiB)
  * @endcode
@@ -28,6 +29,16 @@
 #define EMMK_KERNEL_H
 
 #include "types.h"
+
+/// @name Build-time configuration
+/// @{
+
+/**
+ * Maximum number of CPU cores. Sizes the per-core arrays (per-CPU areas,
+ * TSSs, GDT, slab magazines), so raising it costs memory linearly.
+ */
+#define SMP_MAX_CORES  16
+/// @}
 
 /// @name Virtual address-space layout
 /// @{
@@ -53,6 +64,13 @@
 
 /// Kernel heap window (PML4[384]); see heap.h for its size limit.
 #define HEAP_VIRTUAL_BASE    0xFFFFC00000000000UL
+
+/// Stack window (PML4[416]): stacks from @c vmm_alloc_stack(), each with
+/// an unmapped guard page below it.
+#define STACK_VIRTUAL_BASE   0xFFFFD00000000000UL
+
+/// Size of the stack window (512 GiB, one PML4 entry).
+#define STACK_VIRTUAL_SIZE   (512UL << 30)
 
 /// MMIO window (PML4[448]): device registers mapped by @c vmm_map_mmio().
 #define MMIO_VIRTUAL_BASE    0xFFFFE00000000000UL

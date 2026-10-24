@@ -12,6 +12,7 @@
 
 #include "vmm.h"
 #include "pmm.h"
+#include "cpu.h"
 #include "panic.h"
 #include "serial.h"
 #include "string.h"
@@ -42,6 +43,9 @@ static bool has_1g_pages;
 
 /// Next free address in the MMIO window.
 static uint64_t mmio_next = MMIO_VIRTUAL_BASE;
+
+/// Next free address in the stack window.
+static uint64_t stack_next = STACK_VIRTUAL_BASE;
 
 /// Page counts by size, for the direct-map summary.
 static size_t map_count_4k, map_count_2m, map_count_1g;
@@ -275,15 +279,11 @@ static int map_range_locked(uint64_t vaddr, uint64_t paddr, size_t size,
 static bool cpu_has_1g_pages(void)
 {
     uint32_t eax, ebx, ecx, edx;
-    __asm__ volatile("cpuid"
-                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                     : "a"(0x80000000));
+    cpuid(0x80000000, &eax, &ebx, &ecx, &edx);
     if (eax < 0x80000001)
         return false;
 
-    __asm__ volatile("cpuid"
-                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                     : "a"(0x80000001));
+    cpuid(0x80000001, &eax, &ebx, &ecx, &edx);
     return (edx & (1U << 26)) != 0;
 }
 
@@ -337,13 +337,10 @@ void vmm_init(void)
 
     // ── Identity map for AP startup ─────────────────────
     //
-    // The AP trampoline (0x8000), the boot GDT, and
-    // .ap_trampoline all reside below 2 MiB and are
-    // executed/read at their physical addresses while an
-    // AP enables paging. Page 0 stays unmapped.
-    //
-    // TODO: remove after SMP bring-up (APs only need it
-    //       transiently)
+    // The AP trampoline (0x8000) and the boot GDT reside below 2 MiB and
+    // are executed/read at their physical addresses while an AP enables
+    // paging. Page 0 stays unmapped. Removed by vmm_unmap_identity() once
+    // all APs are up.
     map_range_locked(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE_2M - PAGE_SIZE,
                      PTE_KERNEL_RWX);
 
@@ -377,6 +374,9 @@ void vmm_init(void)
 
     pmm_enable_direct_map();
     kernel_pml4 = (pte_t *)PHYS_TO_VIRT(pml4_phys);
+
+    // Make the read-only mappings above binding for kernel code too
+    cpu_init_core();
 
     kprintf("[VMM] Kernel page tables active, PML4 at phys 0x%lx\n",
             pml4_phys);
@@ -468,6 +468,56 @@ void *vmm_map_mmio(uint64_t paddr, size_t size)
         return NULL;
 
     return (void *)(vaddr + (paddr - base));
+}
+
+uint64_t vmm_alloc_stack(size_t size)
+{
+    size = PAGE_ALIGN_UP(size);
+    if (size == 0)
+        return 0;
+    size_t pages = size / PAGE_SIZE;
+
+    // Reserve the guard page + the stack itself
+    uint64_t irq;
+    spin_lock_irqsave(&vmm_lock, &irq);
+    uint64_t guard = stack_next;
+    bool fits = guard + PAGE_SIZE + size
+             <= STACK_VIRTUAL_BASE + STACK_VIRTUAL_SIZE;
+
+    if (fits)
+        stack_next += PAGE_SIZE + size;
+    spin_unlock_irqrestore(&vmm_lock, irq);
+
+    if (!fits)
+    {
+        kprintf("[VMM] ERROR: stack window exhausted\n");
+        return 0;
+    }
+
+    // Back at the stack page by page (no contiguity needed)
+    uint64_t base = guard + PAGE_SIZE;
+    for (size_t i = 0; i < pages; ++i)
+    {
+        uint64_t paddr = pmm_alloc_page();
+        if (paddr == PMM_ALLOC_FAILED
+            || vmm_map_page(base + i * PAGE_SIZE, paddr,
+                            PTE_KERNEL_RW) != VMM_OK)
+        {
+            if (paddr != PMM_ALLOC_FAILED)
+                pmm_free_page(paddr);
+            for (size_t j = 0; j < i; ++j)
+                pmm_free_page(vmm_unmap_page(base + j * PAGE_SIZE));
+            return 0;
+        }
+    }
+
+    return base + size;
+}
+
+void vmm_unmap_identity(void)
+{
+    vmm_unmap_pages(PAGE_SIZE, PAGE_SIZE_2M / PAGE_SIZE - 1);
+    kprintf("[VMM] Identity map removed\n");
 }
 
 // ── Unmapping ──────────────────────────────────────────────────────────

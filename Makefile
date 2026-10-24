@@ -51,6 +51,11 @@ QEMU_BASE := -m $(MEM) -serial stdio -display none
 QEMU_NET  := -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=udp::8080-:7
 QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
+## KVM=1 -> hardware virtualization with the host CPU model
+ifeq ($(KVM),1)
+QEMU_BASE += -enable-kvm -cpu host
+endif
+
 # ── Source files ────────────────────────────────────────────────────────
 
 ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
@@ -88,11 +93,11 @@ all: build/os.iso
 run: build/os.iso
 	$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) -smp 4
 
-## success -> exit 1, failure -> exit 3
+## success -> exit 33, failure -> exit 3
 test: build/test.iso
 	@$(QEMU) -cdrom $< $(QEMU_BASE) $(QEMU_NET) $(QEMU_TEST) -smp 2 2>/dev/null; \
 	rc=$$?;                                                                      \
-	if [ $$rc -eq 1 ]; then exit 0;                                              \
+	if [ $$rc -eq 33 ]; then exit 0;                                              \
 	else echo "\nTEST RUN FAILED (qemu exit $$rc)"; exit 1; fi
 
 demo: build/demo.iso
