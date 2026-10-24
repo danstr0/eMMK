@@ -7,7 +7,7 @@
  *
  * @par Usage
  * Each test suite is a function returning @c uint32_t (the failure count):
- * @code
+ * @code{.c}
  *   uint32_t test_example(void)
  *   {
  *       TEST_BEGIN("example");
@@ -27,7 +27,7 @@
  * @endcode
  * The test runner calls @c qemu_exit_success() or @c qemu_exit_failure(),
  * which write to that port. QEMU's exit code is @c (value<<1)|1, so
- * success = exit 1, failure = exit 3. The Makefile adjusts accordingly.
+ * success = exit 33, failure = exit 3. The Makefile maps 33 to 0.
  */
 
 #ifndef EMMK_TEST_H
@@ -47,7 +47,7 @@
 /**
  * @brief Terminate QEMU with exit @c (code<<1)|1.
  *
- * Writing @c 0x00 produces host exit code 1 (success).
+ * Writing @c 0x10 produces host exit code 33 (success).
  * Writing @c 0x01 produces host exit code 3 (failure).
  */
 NORETURN static inline void qemu_exit(uint32_t code)
@@ -57,7 +57,7 @@ NORETURN static inline void qemu_exit(uint32_t code)
         __asm__ volatile("hlt");
 }
 
-static inline NORETURN void qemu_exit_success(void) { qemu_exit(0x00); }
+static inline NORETURN void qemu_exit_success(void) { qemu_exit(0x10); }
 static inline NORETURN void qemu_exit_failure(void) { qemu_exit(0x01); }
 /// @}
 
