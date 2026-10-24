@@ -122,6 +122,7 @@ protected_entry:
 ; ── 64-bit long mode ────────────────────────────────────────────────────
 
 bits 64
+default abs      ; [PARAMS + ...] are absolute addresses, not RIP-relative
 long_mode_entry:
     ;; Load 64-bit data segments
     mov ax, 0x10
