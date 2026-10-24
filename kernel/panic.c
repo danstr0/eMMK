@@ -6,6 +6,7 @@
 #include "panic.h"
 #include "serial.h"
 #include "apic.h"
+#include "cpu.h"
 #include "smp.h"
 
 /// Core index of the panicking core, or @c -1 if no panic is in progress.
@@ -30,7 +31,7 @@ static void panic_begin(void)
 {
     __asm__ volatile("cli");
 
-    int me = smp_core_id();
+    int me = rdmsr(MSR_GS_BASE) ? smp_core_id() : 0;
     int expected = -1;
     if (!__atomic_compare_exchange_n(&panic_owner, &expected, me, false,
                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
