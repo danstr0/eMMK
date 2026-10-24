@@ -141,9 +141,11 @@ static inline uint64_t tsc_elapsed_us(uint64_t start, uint64_t end)
 /// @{
 
 /**
- * @brief Busy-wait for @p us microseconds.
+ * @brief Busy-wait for at least @p us microseconds.
  *
- * Works with interrupts disabled and never changes the interrupt flag.
+ * Converts with the exact calibrated frequency (rounded up), so the
+ * delay is never short. Works with interrupts disabled and never changes
+ * the interrupt flag.
  */
 void tsc_delay_us(uint64_t us);
 /// @}

@@ -8,6 +8,7 @@
  */
 
 #include "tsc.h"
+#include "cpu.h"
 #include "pit.h"
 #include "spinlock.h"
 #include "serial.h"
@@ -15,8 +16,11 @@
 /// TSC frequency in Hz (set during calibration).
 static uint64_t tsc_frequency;
 
-/// Cycles per microsecond (rounded down).
+/// Cycles per microsecond (rounded down; for display and callers only).
 static uint64_t cycles_per_us;
+
+/// Cycles per microsecond × 2^24, for exact µs → cycle conversion.
+static uint64_t cycles_per_us_q24;
 
 /// TSC value at the end of calibration.
 static uint64_t tsc_boot;
@@ -31,15 +35,7 @@ uint64_t tsc_ms_mult;
 /// PIT measurement window (the PIT's 16-bit conter allows ≤ 54 ms).
 #define CALIBRATION_MS  50
 
-// ── CPUID helpers ──────────────────────────────────────────────────────
-
-static inline void cpuid(uint32_t leaf, uint32_t *a, uint32_t *b,
-                         uint32_t *c, uint32_t *d)
-{
-    __asm__ volatile("cpuid"
-                     : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
-                     : "a"(leaf), "c"(0));
-}
+// ── Frequency sources ──────────────────────────────────────────────────
 
 /**
  * @brief TSC frequency from CPUID leaf 0x15, if fully reported.
@@ -106,6 +102,9 @@ void tsc_init(void)
     tsc_us_mult = (1000000UL << 40) / tsc_frequency;
     tsc_ms_mult = (1000UL << 48) / tsc_frequency;
 
+    // Rounded up, so delays are never short
+    cycles_per_us_q24 = ((tsc_frequency << 24) + 999999) / 1000000;
+
     tsc_boot = tsc_read();
 
     kprintf("[TSC] %lu.%03lu MHz (via %s), %s\n",
@@ -135,9 +134,10 @@ uint64_t tsc_get_boot(void)
 
 void tsc_delay_us(uint64_t us)
 {
-    uint64_t target = tsc_read() + us * cycles_per_us;
+    uint64_t cycles = tsc_mul_shift(us, cycles_per_us_q24, 24) + 1;
+    uint64_t start  = tsc_read();
 
-    while (tsc_read() < target)
+    while (tsc_read() - start < cycles)
         cpu_relax();
 }
 
