@@ -31,12 +31,7 @@
 #define EMMK_TSS_H
 
 #include "types.h"
-
-// SMP_MAX_CORES is defined in smp.h, but including it here would
-// create a circular dependency
-#ifndef SMP_MAX_CORES
-#define SMP_MAX_CORES  16
-#endif
+#include "kernel.h"
 
 /// @name TSS structure
 /// @{
@@ -78,7 +73,7 @@ STATIC_ASSERT(sizeof(struct tss) == 104, "TSS must be 104 bytes");
 /// IST entry used for NMI handling.
 #define IST_NMI           2
 
-/// Size of each IST stack (bytes).
+/// Size of each IST stack (bytes). Allocated with a guard page below.
 #define IST_STACK_SIZE    (8 * 1024)
 /// @}
 
