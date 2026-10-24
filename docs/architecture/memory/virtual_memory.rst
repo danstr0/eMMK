@@ -87,6 +87,9 @@ RWX, PML4[0]/[511] sharing one PDPT. ``vmm_init()`` replaces them:
    IVT.
 4. Maps every PMM RAM region into the direct map with ``vmm_map_range()``.
 5. Loads CR3, then calls ``pmm_enable_direct_map()``.
+6. Calls ``cpu_init_core()``, which sets **CR0.WP**. Without it, ring-0
+   writes ignore the read-only bit, so none of the permissions above would
+   bind kernel code (all eMMK code). APs do the same in ``ap_entry()``.
 
 The switch is safe because RIP (``.text``), RSP (boot stack), and the
 GDT (identity) are mapped at the same address in both table sets.
@@ -164,6 +167,12 @@ Mapping API
 
   // Device registers: fresh uncached mapping in the MMIO window
   volatile uint32_t *regs = vmm_map_mmio(bar_phys, bar_size);
+
+  // A kernel stack with an unmapped guard page below (returns the top)
+  uint64_t rsp = vmm_alloc_stack(16 * 1024);
+
+  // After SMP bring-up: drop the [4K, 2M) identity map
+  vmm_unmap_identity();
 
   // Remove a mapping
   uint64_t freed_paddr = vmm_unmap_page(vaddr);

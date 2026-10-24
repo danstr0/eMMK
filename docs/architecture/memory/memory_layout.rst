@@ -139,15 +139,15 @@ Consumers of the free pool
      - Yes
      - Includes netbuf structs and 2 KiB packet buffers
    * - AP stacks
-     - ``pmm_alloc_pages``
-     - 16 KiB
+     - ``vmm_alloc_stack``
+     - **No**
      - n/a
-     - No guard page yet
+     - 16 KiB, guard page below
    * - IST stacks
-     - ``pmm_alloc_pages``
-     - 8 KiB
+     - ``vmm_alloc_stack``
+     - **No**
      - n/a
-     - Two per core (#DF, NMI)
+     - 8 KiB, two per core (#DF, NMI), guard page below
    * - virtio rings
      - PMM
      - Yes
@@ -175,9 +175,10 @@ Virtual Address Space
      - Unmapped — NULL dereferences fault
    * - ``0x0000_0000_0000_1000 .. 0x0000_0000_001F_FFFF``
      - 0
-     - Identity map (RWX, 4 KiB pages). Needed only by APs while they
-       enable paging: the trampoline, the boot GDT, and
-       ``.ap_trampoline`` are used at their physical addresses
+     - Identity map (RWX, 4 KiB pages), **only during SMP bring-up**:
+       APs execute the trampoline and load the boot GDT at physical
+       addresses. Removed at the end of ``smp_init()``; afterwards the
+       whole lower half is unmapped
    * - ``0xFFFF_8000_0000_0000 ..``
      - 256+
      - **Direct map**: physical address *p* at ``DIRECT_MAP_BASE + p``,
@@ -187,6 +188,10 @@ Virtual Address Space
    * - ``0xFFFF_C000_0000_0000 ..``
      - 384
      - **Heap** (``kmalloc``), up to 16 MiB
+   * - ``0xFFFF_D000_0000_0000 ..``
+     - 416
+     - **Stack window**: ``vmm_alloc_stack()`` — AP stacks and IST stacks,
+       each preceded by an unmapped guard page
    * - ``0xFFFF_E000_0000_0000 ..``
      - 448
      - **MMIO window**: ``vmm_map_mmio()`` mappings, uncached (PCD|PWT),
@@ -252,8 +257,11 @@ Constraints and Real-Hardware Notes
   kernel PML4 must be below 4 GiB (it is: allocated early, below 1 GiB).
 - **No TLB shootdown:** Changing or removing a mapping after APs are up
   only flushes the local TLB. Creating mappings is safe.
-- **Stacks:** Only the BSP boot stack has a guard page; AP and IST
-  stacks are plain direct-map memory.
+- **Stacks:** Every kernel stack has a guard page: the BSP boot stack
+  (the dead boot page tables below it) and all AP and IST stacks (stack
+  window).
+- **Write protection:** ``CR0.WP`` is set on every core
+  (``cpu_init_core()``), so read-only mappings bind kernel code.
 
 
 Related Files

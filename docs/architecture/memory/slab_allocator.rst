@@ -76,9 +76,8 @@ Constraints
   interrupts. An interrupt handler that allocates or frees from a cache
   on the same core can corrupt that core's magazine. Allocation from
   interrupt context is not supported (eMMK's data path is polled).
-- **Core identification cost:** The fast path calls ``smp_core_id()``,
-  which currently executes ``rdmsr`` (tens of cycles, serializing) on
-  every call. To be replaced with a single ``%gs``-relative load.
+- **Core identification:** The fast path calls ``smp_core_id()``, a
+  single ``%gs``-relative load.
 - **Cross-core producer/consumer:** When one core allocates and another
   frees (e.g., the demo's distributor and workers), the allocating core's
   magazine empties and the freeing core's overflows, so both hit

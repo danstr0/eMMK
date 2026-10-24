@@ -5,11 +5,29 @@ Symmetric Multi-Processing (SMP)
 Overview
 ========
 
-eMMK initializes Application Processors (APs) after the Bootstrap Processor
-(BSP) completes basic subsystem setup (LAPIC, IDT, PMM/VMM, and timers).
-APs are discovered, brought out of real mode via an INIT-SIPI-SIPI sequence,
-guided through long-mode activation by a low-memory assembly trampoline,
-and transitioned into a per-core run loop in C.
+eMMK initializes Application Processors (APs) after the Bootstrap
+Processor (BSP) completes basic subsystem setup (memory, IDT, LAPIC, TSC
+clock, TSS). APs are discovered, brought out of real mode via an
+INIT-SIPI-SIPI sequence, guided through long-mode activation by a
+low-memory assembly trampoline, and transitioned into a per-core run loop
+in C. Startup needs no interrupts on the BSP: all delays use the TSC.
+
+
+Core Discovery
+==============
+The number of logical processors comes from CPUID leaf 1 (``EBX[23:16]``),
+and AP *i* is assumed to have APIC ID *i*.
+
+``TODO``: on real hardware, the processor list must come from the ACPI
+MADT.
+
+Core Indices and Failure Handling
+---------------------------------
+Core indices are dense: the BSP is 0, and each AP that starts gets the
+next free index, which the BSP passes in the parameter block
+(``core_index``). If an AP does not report ready within 100 ms, the BSP
+sends it an INIT IPI — parking it back in wait-for-SIPI — and reuses the
+index for the next AP. 
 
 .. list-table:: **AP Startup Stages**
    :header-rows: 1
@@ -40,7 +58,8 @@ Initialization Flow
     BSP (kernel_main)
      │
      │  1. setup_trampoline() [copy code to 0x8000, write ap_boot_params]
-     │  2. alloc_ap_stack()   [allocate 16 KiB per AP]
+     │  2. vmm_alloc_stack()  [16 KiB per AP, guard page below]
+     │  3. write stack_top, ap_id, core_index
      │
      ├─── Send INIT IPI
      │    Wait 10 ms
@@ -68,17 +87,22 @@ Initialization Flow
      │                                   │
      │  Wait for ap_ready                ▼
      │◄────────────────────────────── ap_entry() [smp.c]
-     │                                ├── Reload segment selectors
+     │                                ├── cpu_init_core() (CR0.WP, SSE bits)
+     │                                ├── percpu_init(core_index) (GS base)
+     │                                ├── Reload DS/ES/FS/SS (not GS)
      │                                ├── Load IDT (lidt)
      │                                ├── Enable LAPIC & TPR
-     │                                ├── Init TSS & Per-CPU (GS base)
+     │                                ├── tss_init_ap() (runtime GDT, TR)
      │                                ├── Enable Interrupts (sti)
      │                                ├── Signal online & ap_ready=1
      │                                └── HLT loop (await launch)
+     │
+     │ (all APs started)
+     ├─ vmm_unmap_identity()
      ▼
   smp_launch_all()
      │
-     └── Set cores[i].launched = true ───────────────▶ Executes assigned run_func()
+     └── launched = true + wake IPI ──▶ flush TLB, execute run_func()
 
 
 Trampoline Page Layout
@@ -141,13 +165,29 @@ issuing IPIs:
      - 64-bit virtual address of ``ap_entry()``.
    * - ``+0x18``
      - ``stack_top``
-     - Virtual address of per-AP stack top (16 KiB allocated).
+     - Virtual address of per-AP stack top (16 KiB, guarded).
    * - ``+0x20``
      - ``ap_ready``
-     - Set to ``1`` by AP when C environment is active.
+     - Set to ``1`` by the AP once fully initialized (TSS, per-CPU).
    * - ``+0x24``
      - ``ap_id``
-     - Target APIC ID assigned by BSP.
+     - APIC ID of the AP being started (read by ``ap_entry``).
+   * - ``+0x28``
+     - ``core_index``
+     - Core index assigned by the BSP (read by ``ap_entry``).
+
+The trampoline reads the fields up to ``stack_top``; ``ap_entry`` reads
+the rest. APs start strictly one at a time (the BSP waits for
+``ap_ready``), so a single block serves them all.
+
+Identity Map Lifetime
+---------------------
+The trampoline runs at physical addresses with paging enabled, and the
+boot GDT it loads has a physical base, so APs need the ``[4 KiB, 2 MiB)``
+identity map until ``tss_init_ap()`` switches them to the runtime GDT.
+Once every AP has reported ready, ``smp_init()`` removes the identity map
+(``vmm_unmap_identity()``); each AP reloads CR3 when it is launched, so no
+stale identity translation survives in any TLB.
 
 
 AP States
@@ -180,8 +220,12 @@ during startup:
    * - **64-bit Long Mode**
      - Paged 64-bit Virtual
      - ``smp.c`` (``ap_entry``)
-     - Load ``RSP``, setup LAPIC/IDT/TSS, set ``GS_BASE`` via MSR, issue
-       ``sti``.
+     - Load ``RSP``; in ``ap_entry``: control registers, ``GS_BASE``, IDT,
+       LAPIC, TSS; issue ``sti``.
+
+Every AP gets the same control-register state as the BSP via
+``cpu_init_core()``: **CR0.WP** (ring-0 writes honor read-only pages)
+and the SSE enable bits.
 
 
 Per-Core Identification & Storage
@@ -189,16 +233,17 @@ Per-Core Identification & Storage
 Core numbering follows a dense index scheme ``0 .. smp_get_core_count()-1``,
 in which Core 0 is strictly reserved for the BSP.
 
-Fast-Path Core Identification
------------------------------
-When querying the current core index via ``smp_core_id()``:
+``smp_core_id()`` is a single ``%gs``-relative load of the per-CPU
+``core_index`` (see :doc:`tss_percpu`). It is valid from the first
+statement of ``kernel_main()`` / ``ap_entry()``.
 
-1. **Fast path:** Reads ``MSR_GS_BASE`` (``0xC0000101``). If initialized
-   (non-zero), it returns ``this_core_id()`` directly from the per-CPU
-   data structure via a single instruction.
-2. **Early boot fallback:** If ``GS_BASE`` is zero (pre-percpu setup), it
-   reads the Local APIC ID directly from the LAPIC hardware register and
-   performs a lookup against the global ``cores[]`` array.
+Stacks
+------
+Each AP's 16 KiB stack and every core's two IST stacks come from
+``vmm_alloc_stack()``: mapped in the stack window with an unmapped guard
+page below. A stack overflow faults on the guard page; the page fault
+cannot push its frame, escalates to #DF, and is reported from the #DF IST
+stack.
 
 
 Work Assignment & Dispatch
