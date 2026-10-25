@@ -7,12 +7,38 @@
 #include "test.h"
 #include "udp.h"
 #include "ip.h"
+#include "arp.h"
 #include "ethernet.h"
 #include "netdev.h"
 #include "endian.h"
+#include "smp.h"
 
 // Dummy handler for UDP bind tests
 static void udp_test_handler(struct netbuf *nb) { netbuf_free(nb); }
+
+// Fake network device
+
+static int fake_sent;
+
+/// send op that "transmits" by counting; consumes @p nb per the contract.
+static int fake_send_ok(struct netdev *dev, struct netbuf *nb)
+{
+    (void)dev;
+    fake_sent++;
+    netbuf_free(nb);
+    return 0;
+}
+
+/// send op that fails; still consumes @p nb, as the contract requires.
+static int fake_send_fail(struct netdev *dev, struct netbuf *nb)
+{
+    (void)dev;
+    netbuf_free(nb);
+    return -1;
+}
+
+static const struct netdev_ops fake_ok_ops   = { .send = fake_send_ok };
+static const struct netdev_ops fake_fail_ops = { .send = fake_send_fail };
 
 uint32_t test_net(void)
 {
@@ -168,6 +194,68 @@ uint32_t test_net(void)
         // Clean up
         udp_unbind(9999);
         udp_unbind(9998);
+    }
+
+    // ── Transmit through a fake netdev ──────────────────
+    struct netdev *fake = netdev_alloc("fake0");
+    TEST_ASSERT(fake != NULL, "fake netdev allocated");
+    if (fake)
+    {
+        uint8_t peer_mac[ETH_ALEN] = {0x02, 0, 0, 0, 0, 0x01};
+        fake->mac[0] = 0x02;
+        fake->mac[5] = 0x02;
+        fake->ops = &fake_ok_ops;
+        netdev_register(fake);
+        netdev_set_up(fake);
+        netdev_set_ip(fake, IP4_ADDR(10, 9, 9, 2),
+                      IP4_ADDR(255, 255, 255, 0), 0);
+        arp_add_static(IP4_ADDR(10, 9, 9, 1), peer_mac, fake);
+    
+        // eth_output must consume nb exactly once when the driver fails
+        {
+            fake->ops = &fake_fail_ops;
+            struct netbuf *nb = netbuf_alloc(0);
+            netbuf_reserve(nb, NETBUF_HEADROOM);
+            netbuf_put(nb, 20);
+            nb->dev = fake;
+            nb->refcount++;
+
+            int ret = eth_output(nb, peer_mac, ETH_P_IP);
+            TEST_ASSERT_EQ(ret, -1, "eth_output reports driver failure");
+            TEST_ASSERT_EQ(nb->refcount, 1,
+                           "failed send consumes nb exactly once");
+            netbuf_free(nb);
+            fake->ops = &fake_ok_ops;
+        }
+    
+        // Direct transmission (no TX owner)
+        fake_sent = 0;
+        TEST_ASSERT_EQ(udp_send(IP4_ADDR(10, 9, 9, 1), 1234, 7, "x", 1),
+                                0, "udp_send succeeds");
+        TEST_ASSERT_EQ(fake_sent, 1, "sent directly without a TX owner");
+    
+        // Handoff to a TX owner on another core
+        if (smp_get_core_count() >= 2)
+        {
+            ip_set_tx_owner(1);
+        
+            fake_sent = 0;
+            udp_send(IP4_ADDR(10, 9, 9, 1), 1234, 7, "y", 1);
+            TEST_ASSERT_EQ(fake_sent, 0, "non-owner does not transmit");
+            TEST_ASSERT_EQ(ip_tx_pending(), 1, "packet waits in handoff ring");
+
+            TEST_ASSERT_EQ(ip_tx_drain(), 1, "drain finishes one packet");
+            TEST_ASSERT_EQ(ip_tx_pending(), 0, "handoff ring empty");
+            TEST_ASSERT_EQ(fake_sent, 1, "drained packet transmitted");
+        
+            ip_set_tx_owner(-1);
+            udp_send(IP4_ADDR(10, 9, 9, 1), 1234, 7, "z", 1);
+            TEST_ASSERT_EQ(fake_sent, 2, "owner cleared: direct again");
+        }
+        else
+            kprintf("  single-core: TX handoff test skipped\n");
+    
+        netdev_unregister(fake);
     }
 
     TEST_END();

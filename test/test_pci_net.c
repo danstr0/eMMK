@@ -71,6 +71,10 @@ uint32_t test_pci_net(void)
         for (int i = 0; i < 6; ++i)
             if (mac[i] != 0) { nonzero = true; break; }
         TEST_ASSERT(nonzero, "MAC address is nonzero");
+
+        // QEMU assigns 52:54:00:xx:xx:xx
+        TEST_ASSERT(mac[0] == 0x52 && mac[1] == 0x54 && mac[2] == 0x00,
+                    "MAC has QEMU's 52:54:00 prefix");
     }
 
     // ── Link is up ──────────────────────────────────────
