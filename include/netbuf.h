@@ -95,12 +95,13 @@ struct netbuf
     void *transport_header;  ///< TCP / UDP / ICMP header.
     /// @}
 
-    /// @name Addressing (IPv4 only for v0.1)
+    /// @name Addressing (IPv4 only for now)
     /// @{
     uint32_t src_ip;
     uint32_t dst_ip;
     uint16_t src_port;
     uint16_t dst_port;
+    uint32_t next_hop;
     /// @}
 
     /// @name Device and queuing
