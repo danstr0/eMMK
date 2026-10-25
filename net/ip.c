@@ -12,11 +12,24 @@
 #include "endian.h"
 #include "serial.h"
 #include "string.h"
+#include "smp.h"
+#include "spsc.h"
 
 // ── State ──────────────────────────────────────────────────────────────
 
-/// Monotonically increasing IP identification field.
+/// IP identification field generator. Incremented atomically.
 static uint16_t ip_id_counter = 0;
+
+/// Core that performs ARP resolution and transmission, or @c -1 for any.
+static volatile int ip_tx_owner = -1;
+
+/// Per-core handoff rings to the TX owner.
+static struct spsc_ring *ip_tx_rings[SMP_MAX_CORES];
+
+/// Per-core count of packets dropped on a full handoff ring.
+static uint64_t ip_tx_drops[SMP_MAX_CORES];
+
+static int ip_output_finish(struct netbuf *nb);
 
 // ── Initialization ─────────────────────────────────────────────────────
 
@@ -242,11 +255,12 @@ int ip_output(struct netbuf *nb, uint32_t dst_ip, uint8_t protocol)
     }
 
     // Fill in the header fields
+    uint16_t id = __atomic_fetch_add(&ip_id_counter, 1, __ATOMIC_RELAXED);
     ip->version  = IP_VERSION;
     ip->ihl      = IP_HDR_MIN / 4;  // 5 (no options)
     ip->tos      = 0;
     ip->tot_len  = htons(nb->len);
-    ip->id       = htons(ip_id_counter++);
+    ip->id       = htons(id);
     ip->frag_off = htons(IP_FLAG_DF);
     ip->ttl      = IP_DEFAULT_TTL;
     ip->protocol = protocol;
@@ -258,22 +272,108 @@ int ip_output(struct netbuf *nb, uint32_t dst_ip, uint8_t protocol)
     ip->check = ip_checksum(ip, IP_HDR_MIN);
 
     nb->network_header = ip;
-    nb->dst_ip = dst_ip;
+    nb->dst_ip   = dst_ip;
+    nb->next_hop = next_hop;
 
-    // Resolve the next-hop MAC address
+    // Not the TX owner: hand the packet over
+    int owner = ip_tx_owner;
+    int me    = smp_core_id();
+    if (owner >= 0 && me != owner)
+    {
+        struct spsc_ring *ring = ip_tx_rings[me];
+        if (!ring || !spsc_ring_enqueue(ring, nb))
+        {
+            ip_tx_drops[me]++;
+            netbuf_free(nb);
+            return -1;
+        }
+        return 0;
+    }
+
+    return ip_output_finish(nb);
+}
+
+/**
+ * @brief Second half of @c ip_output(): ARP resolution and transmit.
+ *
+ * Runs on the TX owner (or on any core when no owner is set). Uses
+ * @c nb->dev and @c nb->next_hop set but @c ip_output().
+ */
+static int ip_output_finish(struct netbuf *nb)
+{
     uint8_t dst_mac[ETH_ALEN];
-    int arp_result = arp_resolve(dev, next_hop, dst_mac);
+    int arp_result = arp_resolve(nb->dev, nb->next_hop, dst_mac);
 
     switch (arp_result)
     {
         case ARP_OK:
             return ip_output_resolved(nb, dst_mac);
         case ARP_PENDING:
-            return arp_queue_packet(dev, next_hop, nb);
+            return arp_queue_packet(nb->dev, nb->next_hop, nb);
         default:
             netbuf_free(nb);
             return -1;
     }
+}
+
+// ── TX ownership ───────────────────────────────────────────────────────
+
+void ip_set_tx_owner(int core)
+{
+    if (core >= 0)
+    {
+        int cores = smp_get_core_count();
+        for (int i = 0; i < cores && i < SMP_MAX_CORES; ++i)
+            if (i != core && !ip_tx_rings[i])
+            {
+                ip_tx_rings[i] = spsc_ring_create(IP_TX_RING_SIZE);
+                if (!ip_tx_rings[i])
+                    kprintf("[IP] ERROR: no TX handoff ring for core %d\n", i);
+            }
+    }
+
+    // Rings must be visible before any core sees the new owner
+    barrier();
+    ip_tx_owner = core;
+
+    if (core >= 0)
+        kprintf("[IP] TX owner: core %d (other cores hand off)\n", core);
+}
+
+size_t ip_tx_drain(void)
+{
+    size_t n = 0;
+    for (int i = 0; i < SMP_MAX_CORES; ++i)
+    {
+        struct spsc_ring *ring = ip_tx_rings[i];
+        if (!ring)
+            continue;
+    
+        void *p;
+        while (spsc_ring_dequeue(ring, &p))
+        {
+            ip_output_finish((struct netbuf *)p);
+            n++;
+        }
+    }
+    return n;
+}
+
+size_t ip_tx_pending(void)
+{
+    size_t n = 0;
+    for (int i = 0; i < SMP_MAX_CORES; ++i)
+        if (ip_tx_rings[i])
+            n += spsc_ring_count(ip_tx_rings[i]);
+    return n;
+}
+
+uint64_t ip_tx_handoff_drops(void)
+{
+    uint64_t n = 0;
+    for (int i = 0; i < SMP_MAX_CORES; ++i)
+        n += ip_tx_drops[i];
+    return n;
 }
 
 int ip_output_resolved(struct netbuf *nb, const uint8_t *dst_mac)
