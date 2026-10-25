@@ -149,10 +149,6 @@ int eth_output(struct netbuf *nb, const uint8_t *dest, uint16_t ethertype)
     }
 
     // Transmit via the network device
-    int ret = netdev_send(dev, nb);
-    if (ret != 0)
-        netbuf_free(nb);
-
-    return ret;
+    return netdev_send(dev, nb);
 }
 

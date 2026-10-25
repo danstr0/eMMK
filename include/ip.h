@@ -146,6 +146,37 @@ int ip_output(struct netbuf *nb, uint32_t dst_ip, uint8_t protocol);
 int ip_output_resolved(struct netbuf *nb, const uint8_t *dst_mac);
 /// @}
 
+/// @name Transmit ownership (single-queue NIC)
+///
+/// With one TX virtqueue and one ARP cache, only one core may resolve
+/// next hops and transmit. This is an interim measure; with multiqueue
+/// this handoff disappears.
+/// @{
+
+/// Ring size for each core's TX handoff ring.
+#define IP_TX_RING_SIZE  256
+
+/**
+ * @brief Make @p core the only core that transmits.
+ *
+ * Creates a handoff ring for every other online core. Call before the
+ * other cores start sending (i.e., before @c smp_launch_all()). Pass
+ * @c -1 to return to direct transmission from every core.
+ */
+void ip_set_tx_owner(int core);
+
+/**
+ * @brief Finish packets handed off by other cores (owner core only).
+ * @return Number of packets processed.
+ */
+size_t ip_tx_drain(void);
+
+/// @return Packets currently waiting in all handoff rings.
+size_t ip_tx_pending(void);
+
+/// @return Packets dropped because a handoff ring was full.
+uint64_t ip_tx_handoff_drops(void);
+
 /// @name Checksum
 /// @{
 

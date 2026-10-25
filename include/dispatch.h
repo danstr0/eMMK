@@ -30,8 +30,11 @@
  * full network stack (@c eth_input → @c ip_input → protocol handler). No
  * locks are needed on the data path.
  *
- * Non-IP traffic (ARP) is processed directly by the distributor to
- * keep the ARP cache single-threaded.
+ * Non-IP traffic (ARP) is processed directly by the distributor, and the
+ * distributor is the only core that transmits: @c dispatch_init() makes
+ * it the IP TX owner, so workers' replies are handed back to it over
+ * per-core SPSC rings. The NIC's single TX queue and the ARP cache
+ * therefore each have exactly one user.
  *
  * @par Usage
  * @code{.c}
@@ -88,8 +91,9 @@ struct dispatch_stats
 /**
  * @brief Configure the dispatch system.
  *
- * Creates a SPSC ring for each worker core. Must be called before
- * @c smp_launch_all().
+ * Creates a SPSC ring for each worker core and makes the calling core
+ * (the distributor) the IP TX owner. Must be called on the distributor
+ * core, before @c smp_launch_all().
  *
  * @param worker_cores  Array of core indices designated as workers.
  * @param num_workers   Number of entries in @p worker_cores.
@@ -131,8 +135,9 @@ NORETURN void dispatch_worker_loop(int core_index);
  * @brief Distribute one batch of received packets.
  *
  * Dequeues all packets from the default netdev's RX queue, hashes
- * each to a worker, and enqueues. Called internally by the
- * distributor loop; exposed for custom distributor implementations.
+ * each to a worker, and enqueues; then transmits the replies workers
+ * handed back (@c ip_tx_drain()). Called internally by the distributor
+ * loop; exposed for custom distributor implementations.
  */
 void dispatch_rx(void);
 

@@ -68,9 +68,9 @@ struct virtio_device *virtio_device_init(struct pci_device *pci)
     vdev->pci     = pci;
     vdev->io_base = (uint16_t)pci->bar[0].base;
 
-    // Config space offset shifts when MSI-X is active
-    vdev->config_offset = pci->cap_msix ? VIRTIO_PCI_CONFIG_MSIX
-                                        : VIRTIO_PCI_CONFIG;
+    // Device config starts at offset 20, and moves to 24 only once MSI-X
+    // is actually enabled
+    vdev->config_offset = VIRTIO_PCI_CONFIG;
 
     // Enable PCI I/O and bus mastering
     pci_enable_device(pci);

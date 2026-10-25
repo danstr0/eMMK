@@ -18,8 +18,12 @@
  * @par RX model
  * The driver pre-populates the RX queue with empty buffers. When the
  * device receives a packet, it fills a buffer and places it on the
- * used ring. The driver processes completions via polling
- * (@c virtio_net_poll) or interrupt (@c virtio_net_irq_handler).
+ * used ring. The driver processes completions only by polling
+ * (@c virtio_net_poll); the interrupt merely wakes an idle core.
+ *
+ * @warning Not Thread-safe: @c virtio_net_send() and @c virtio_net_poll()
+ *          must be called from a single core (the TX owner; see
+ *          @c ip_set_tx_owner()).
  *
  * For a run-to-completion architecture, register a receive callback
  * with @c virtio_net_set_rx_callback() to process packets inline.
@@ -150,8 +154,8 @@ struct virtio_net_config
 /**
  * @brief Per-packet receive callback type.
  *
- * Invoked inline during @c virtio_net_poll() or
- * @c virtio_net_irq_handler() for each completed RX packet.
+ * Invoked inline during @c virtio_net_poll() for each completed RX
+ * packet.
  *
  * @param data  Pointer to Ethernet frame (after the virtio-net
  *              header has been stripped). Valid only for the duration
@@ -302,9 +306,9 @@ bool virtio_net_link_up(struct virtio_net_dev *dev);
 /**
  * @brief Top-level ISR for virtio-net interrupts.
  *
- * Reads the ISR status register to acknowledge the interrupt, then
- * calls @c virtio_net_poll() to process completions. Registered via
- * @c idt_set_handler() during @c virtio_net_init().
+ * Reads the ISR status register and sends EOI. Its only purpose is to
+ * wake a core idling in @c hlt; packets are processed by the poll loop.
+ * Registered via @c idt_set_handler() during @c virtio_net_init().
  *
  * @param frame  Interrupt frame (from the IDT dispatcher).
  */
