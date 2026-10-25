@@ -226,6 +226,9 @@ struct virtio_net_dev *virtio_net_init(void)
     {
         if (pci_msix_enable(pci) == 0)
         {
+            // Device config now sits after the MSI-X vector registers
+            vdev->config_offset = VIRTIO_PCI_CONFIG_MSIX;
+
             pci_msix_set_entry(pci, 0, VIRTIO_NET_MSIX_VECTOR, lapic_id());
             idt_set_handler(VIRTIO_NET_MSIX_VECTOR, virtio_net_irq_handler);
 
