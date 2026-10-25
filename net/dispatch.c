@@ -60,6 +60,10 @@ void dispatch_init(const int *worker_cores, int num_workers)
 
     kprintf("[DISPATCH] Initialized: %d worker(s), ring size %d\n",
             num_workers_active, DISPATCH_RING_SIZE);
+
+    // The NIC currently has one TX queue and the stack one ARP cache;
+    // only the distributor may resolve and transmit
+    ip_set_tx_owner(smp_core_id());
 }
 
 // ── Packet classification and distribution ─────────────────────────────
@@ -148,6 +152,9 @@ void dispatch_rx(void)
     struct netbuf *nb;
     while ((nb = netbuf_queue_pop(&dev->rx_queue)) != NULL)
         dispatch_one(nb);
+
+    // Transmit replies the workers handed back
+    ip_tx_drain();
 }
 
 // ── Core loops ─────────────────────────────────────────────────────────
@@ -191,11 +198,7 @@ NORETURN void dispatch_worker_loop(int core_index)
     {
         void *ptr;
         while (spsc_ring_dequeue(ring, &ptr))
-        {
-            kprintf("[WORKER] Successfully received packet; processing\n");
-            struct netbuf *nb = (struct netbuf *)ptr;
-            eth_input(nb);
-        }
+            eth_input((struct netbuf *)ptr);
 
         __asm__ volatile("pause");
     }
