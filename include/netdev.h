@@ -38,7 +38,7 @@
 /// @{
 
 /// Maximum number of registered network devices.
-#define NETDEV_MAX  4
+#define NETDEV_MAX  16
 /// @}
 
 /// @name Device flags
@@ -146,7 +146,11 @@ struct netdev *netdev_alloc(const char *name);
 
 /**
  * @brief Register a network device with the subsystem.
- * @return 0 on success, -1 if the device table is full.
+ * 
+ * A device with an empty name gets the lowest unused @c ethN.
+ *
+ * @return @c 0 on success, @c -1 if the device table is full or the name
+ *         is already taken.
  */
 int netdev_register(struct netdev *dev);
 
@@ -162,6 +166,15 @@ struct netdev *netdev_find(const char *name);
 
 /// Get the first registered device (default). Returns @c NULL if none.
 struct netdev *netdev_get_default(void);
+
+/// @return Number of registered devices.
+int netdev_count(void);
+
+/**
+ * @return The @p index-th registered device (registration order), or
+ *         @c NULL.
+ */
+struct netdev *netdev_get(int index);
 /// @}
 
 /// @name Data path
@@ -175,7 +188,7 @@ struct netdev *netdev_get_default(void);
  *
  * @param dev  Network device.
  * @param nb   Network buffer.
- * @return 0 on success, -1 on failure.
+ * @return @c 0 on success, @c -1 on failure.
  */
 int netdev_send(struct netdev *dev, struct netbuf *nb);
 
