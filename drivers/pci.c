@@ -1,19 +1,28 @@
 /**
  * @file pci.c
- * @brief PCI bus driver — enumeration, config access, and MSI-X.
+ * @brief PCI bus driver — enumeration, config access, device probing,
+ *        and MSI-X.
  */
 
 #include "pci.h"
 #include "io.h"
+#include "irq.h"
 #include "vmm.h"
 #include "serial.h"
 #include "string.h"
 #include "apic.h"
 
-// ── Device table ───────────────────────────────────────────────────────
+// ── Device table and driver registry ───────────────────────────────────
 
 static struct pci_device devices[PCI_MAX_DEVICES];
 static int device_count = 0;
+
+static const struct pci_driver *drivers[PCI_MAX_DRIVERS];
+static int driver_count = 0;
+
+/// Set once @c pci_init() has enumerated; later registrations probe
+/// at once.
+static bool enumerated = false;
 
 // ── Config space address construction ──────────────────────────────────
 
@@ -85,8 +94,12 @@ void pci_write8(uint8_t bus, uint8_t dev, uint8_t func,
 /**
  * @brief Decode a single BAR.
  *
- * For 64-bit memory BARs, reads and restores both the low and high 
+ * For 64-bit memory BARs, reads and restores both the low and high
  * dwords and marks the next BAR slot as consumed.
+ *
+ * @pre I/O and memory decode are disabled in @c COMMAND (see
+ *      @c pci_size_bars()): while all-ones is written, the BAR would
+ *      otherwise claim the top of the address space.
  */
 static void pci_read_bar(struct pci_device *pdev, int bar)
 {
@@ -141,15 +154,39 @@ static void pci_read_bar(struct pci_device *pdev, int bar)
     }
 }
 
+/**
+ * @brief Size all six BARs of a type 0 function.
+ *
+ * Disables I/O and memory decode for the duration and restores the
+ * original @c COMMAND value afterwards.
+ */
+static void pci_size_bars(struct pci_device *pdev)
+{
+    uint16_t cmd = pci_device_read16(pdev, PCI_COMMAND);
+    pci_device_write16(pdev, PCI_COMMAND,
+                       cmd & ~(PCI_CMD_IO | PCI_CMD_MEMORY));
+
+    for (int i = 0; i < 6; ++i)
+    {
+        pci_read_bar(pdev, i);
+        if (pdev->bar[i].is_64bit)
+            ++i;  // skip next slot
+    }
+
+    pci_device_write16(pdev, PCI_COMMAND, cmd);
+}
+
 // ── Capability list walking ────────────────────────────────────────────
 
-uint8_t pci_find_capability(struct pci_device *dev, uint8_t cap_id)
+uint8_t pci_find_next_capability(struct pci_device *dev, uint8_t cap_id,
+                                 uint8_t prev)
 {
     uint16_t status = pci_device_read16(dev, PCI_STATUS);
     if (!(status & PCI_STATUS_CAPS))
         return 0;
 
-    uint8_t ptr = pci_device_read8(dev, PCI_CAPABILITIES) & 0xFC;
+    uint8_t ptr = prev ? pci_device_read8(dev, prev + 1) & 0xFC
+                       : pci_device_read8(dev, PCI_CAPABILITIES) & 0xFC;
     int limit = 48;  // guards against infinite loops in malformed lists
 
     while (ptr && limit-- > 0)
@@ -161,6 +198,11 @@ uint8_t pci_find_capability(struct pci_device *dev, uint8_t cap_id)
     }
 
     return 0;
+}
+
+uint8_t pci_find_capability(struct pci_device *dev, uint8_t cap_id)
+{
+    return pci_find_next_capability(dev, cap_id, 0);
 }
 
 // ── Enumeration ────────────────────────────────────────────────────────
@@ -202,12 +244,7 @@ static void pci_enumerate_function(uint8_t bus, uint8_t dev, uint8_t func)
 
     // Decode BARs (Type 0 headers only)
     if ((pdev->header_type & PCI_HEADER_TYPE_MASK) == 0)
-        for (int i = 0; i < 6; ++i)
-        {
-            pci_read_bar(pdev, i);
-            if (pdev->bar[i].is_64bit)
-                ++i;  // skip next slot
-        }
+        pci_size_bars(pdev);
 
     // Walk capability list
     pdev->cap_msi    = pci_find_capability(pdev, PCI_CAP_MSI);
@@ -277,12 +314,92 @@ static void pci_enumerate_bus(uint8_t bus)
     }
 }
 
+// ── Driver probing ─────────────────────────────────────────────────────
+
+bool pci_match_id(const struct pci_device_id *ids,
+                  const struct pci_device *dev)
+{
+    if (!ids || !dev)
+        return false;
+
+    for (; ids->vendor != 0; ++ids)
+        if ((ids->vendor == PCI_ANY_ID || ids->vendor == dev->vendor_id)
+         && (ids->device == PCI_ANY_ID || ids->device == dev->device_id))
+            return true;
+
+    return false;
+}
+
+/**
+ * @brief Offer every unbound device that matches @p drv to its probe.
+ * @return Number of devices the driver bound.
+ */
+static int pci_probe_driver(const struct pci_driver *drv)
+{
+    int bound = 0;
+
+    for (int i = 0; i < device_count; ++i)
+    {
+        struct pci_device *dev = &devices[i];
+        if (dev->driver || !pci_match_id(drv->ids, dev))
+            continue;
+    
+        if (drv->probe(dev) == 0)
+        {
+            dev->driver = drv;
+            bound++;
+            kprintf("[PCI] %x:%x.%x bound to %s\n",
+                    dev->bus, dev->device, dev->function, drv->name);
+        }
+    }
+
+    return bound;
+}
+
+int pci_register_driver(const struct pci_driver *drv)
+{
+    if (!drv || !drv->ids || !drv->probe)
+        return -1;
+
+    for (int i = 0; i < driver_count; ++i)
+        if (drivers[i] == drv)
+            return -1;
+
+    if (driver_count >= PCI_MAX_DRIVERS)
+    {
+        kprintf("[PCI] Driver registry full, cannot add %s\n", drv->name);
+        return -1;
+    }
+
+    drivers[driver_count++] = drv;
+
+    // Before enumeration pci_init() does the probing
+    return enumerated ? pci_probe_driver(drv) : 0;
+}
+
+void pci_unregister_driver(const struct pci_driver *drv)
+{
+    for (int i = 0; i < driver_count; ++i)
+        if (drivers[i] == drv)
+        {
+            for (int j = i; j < driver_count - 1; ++j)
+                drivers[j] = drivers[j + 1];
+            drivers[--driver_count] = NULL;
+            break;
+        }
+
+    for (int i = 0; i < device_count; ++i)
+        if (devices[i].driver == drv)
+            devices[i].driver = NULL;
+}
+
 // ── Initialization ─────────────────────────────────────────────────────
 
 void pci_init(void)
 {
     kprintf("[PCI] Enumerating devices...\n");
     device_count = 0;
+    enumerated = false;
 
     // Verify a host bridge exists on bus 0
     if (pci_read32(0, 0, 0, 0) == 0xFFFFFFFF)
@@ -304,6 +421,11 @@ void pci_init(void)
         pci_enumerate_bus(0);
 
     kprintf("[PCI] Enumeration complete: %d device(s)\n", device_count);
+    enumerated = true;
+
+    // Offer every device to the registered drivers, in registration order
+    for (int i = 0; i < driver_count; ++i)
+        pci_probe_driver(drivers[i]);
 }
 
 // ── Device lookup ──────────────────────────────────────────────────────
@@ -378,6 +500,22 @@ uint64_t pci_get_bar_size(struct pci_device *dev, int bar)
     return dev->bar[bar].size;
 }
 
+void *pci_map_bar(struct pci_device *dev, int bar)
+{
+    if (!dev || bar < 0 || bar > 5)
+        return NULL;
+
+    // The upper half of a 64-bit BAR has size 0 and is rejected here
+    if (dev->bar[bar].is_io || dev->bar[bar].size == 0
+     || dev->bar[bar].base == 0)
+        return NULL;
+
+    if (!dev->bar[bar].virt)
+        dev->bar[bar].virt = vmm_map_mmio(dev->bar[bar].base,
+                                          dev->bar[bar].size);
+    return dev->bar[bar].virt;
+}
+
 // ── Device table access ────────────────────────────────────────────────
 
 int pci_get_device_count(void)
@@ -402,37 +540,40 @@ int pci_msix_enable(struct pci_device *dev)
         return -1;
     }
 
+    if (dev->msix_table)
+        return 0;  // already enabled
+
     uint8_t cap = dev->cap_msix;
 
     // Read message control to get table size
     uint16_t msg_ctrl = pci_device_read16(dev, cap + MSIX_MSG_CTRL);
-    dev->msix_count = (msg_ctrl & MSIX_CTRL_SIZE_MASK) + 1;
+    uint16_t count = (msg_ctrl & MSIX_CTRL_SIZE_MASK) + 1;
 
     // Read table location: BAR index and offset
     uint32_t table_info   = pci_device_read32(dev, cap + MSIX_TABLE_OFFSET);
     uint8_t  table_bir    = table_info & MSIX_BAR_MASK;
     uint32_t table_offset = table_info & MSIX_OFFSET_MASK;
 
-    // Get the BAR's physical base address
-    uint64_t bar_phys = dev->bar[table_bir].base;
-    if (bar_phys == 0)
+    if (table_bir > 5
+        || (uint64_t)table_offset + count * sizeof(struct msix_entry)
+           > dev->bar[table_bir].size)
     {
-        kprintf("[PCI] %x:%x.%x: MSI-X table BAR%u not configured\n",
+        kprintf("[PCI] %x:%x.%x: MSI-X table outside BAR%u\n",
                 dev->bus, dev->device, dev->function, table_bir);
         return -1;
     }
 
-    // Map the MSI-X table (uncached); each device gets its own mapping
-    uint64_t table_phys = bar_phys + table_offset;
-    size_t table_size   = dev->msix_count * sizeof(struct msix_entry);
-    
-    dev->msix_table = (volatile struct msix_entry *)
-                      vmm_map_mmio(table_phys, table_size);
-    if (!dev->msix_table)
+    // Map the table's BAR (uncached). Each device has its own mapping
+    uint8_t *bar_virt = pci_map_bar(dev, table_bir);
+    if (!bar_virt)
     {
-        kprintf("[PCI] Failed to map MSI-X table\n");
+        kprintf("[PCI] %x:%x.%x: cannot map MSI-X table BAR%u\n",
+                dev->bus, dev->device, dev->function, table_bir);
         return -1;
     }
+
+    dev->msix_count = count;
+    dev->msix_table = (volatile struct msix_entry *)(bar_virt + table_offset);
 
     // Mask all vectors initially
     for (uint16_t i = 0; i < dev->msix_count; ++i)
@@ -478,6 +619,61 @@ void pci_msix_set_entry(struct pci_device *dev, uint16_t index,
 
     // Unmask this vector
     entry->vector_ctrl = 0;
+}
+
+int pci_msix_alloc(struct pci_device *dev, uint16_t n,
+                   interrupt_handler_t handler, void *ctx)
+{
+    if (!dev || !handler || n == 0 || n > PCI_MSIX_MAX_VECTORS
+        || dev->msix_allocated != 0)
+        return -1;
+
+    if (pci_msix_enable(dev) < 0)
+        return -1;
+
+    if (n > dev->msix_count)
+    {
+        kprintf("[PCI] %x:%x.%x: %u MSI-X entries requested, "
+                "%u available\n",
+                dev->bus, dev->device, dev->function, n, dev->msix_count);
+        return -1;
+    }
+
+    for (uint16_t i = 0; i < n; ++i)
+    {
+        int vector = irq_alloc_vector(handler, ctx);
+        if (vector < 0)
+        {
+            kprintf("[PCI] %x:%x.%x: out of interrupt vectors\n",
+                    dev->bus, dev->device, dev->function);
+            dev->msix_allocated = i;
+            pci_msix_free(dev);
+            return -1;
+        }
+        dev->msix_vectors[i] = (uint8_t)vector;
+    }
+    dev->msix_allocated = n;
+
+    // Program the entries only once every vector exists
+    uint32_t apic = lapic_id();
+    for (uint16_t i = 0; i < n; ++i)
+        pci_msix_set_entry(dev, i, dev->msix_vectors[i], apic);
+
+    return 0;
+}
+
+void pci_msix_free(struct pci_device *dev)
+{
+    if (!dev)
+        return;
+
+    for (uint16_t i = 0; i < dev->msix_allocated; ++i)
+    {
+        pci_msix_mask(dev, i);
+        irq_free_vector(dev->msix_vectors[i]);
+        dev->msix_vectors[i] = 0;
+    }
+    dev->msix_allocated = 0;
 }
 
 void pci_msix_mask(struct pci_device *dev, uint16_t index)
