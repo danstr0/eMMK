@@ -47,8 +47,15 @@ LDFLAGS := -nostdlib               \
 ## Guest RAM (e.g., MEM=4G)
 MEM ?= 128M
 
+## Number of virtio-net NICs; each is its own slirp network, only the
+## first forwards host UDP port 8080 (demo echo)
+NICS ?= 2
+
 QEMU_BASE := -m $(MEM) -serial stdio -display none
 QEMU_NET  := -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=udp::8080-:7
+ifeq ($(NICS),2)
+QEMU_NET  += -device virtio-net-pci,netdev=net1 -netdev user,id=net1,net=10.0.3.0/24
+endif
 QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
 ## KVM=1 -> hardware virtualization with the host CPU model
@@ -62,7 +69,7 @@ ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
 			boot/ap_trampoline.asm
 
 KERN_SRC := kernel/serial.c kernel/format.c kernel/string.c kernel/idt.c \
-			kernel/panic.c                                               \
+			kernel/panic.c kernel/irq.c                                  \
             kernel/pic.c kernel/apic.c kernel/timer.c                    \
 			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c       \
 			kernel/log.c kernel/spsc.c kernel/bench.c                    \
