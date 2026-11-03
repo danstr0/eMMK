@@ -9,6 +9,7 @@
 
 #include "test.h"
 #include "idt.h"
+#include "irq.h"
 #include "apic.h"
 #include "cpu.h"
 #include "timer.h"
@@ -19,6 +20,7 @@
 
 static volatile bool int3_fired;
 static volatile int  test_ipi_count;
+static void * volatile test_ipi_ctx;
 
 static void test_int3_handler(struct interrupt_frame *frame)
 {
@@ -28,10 +30,16 @@ static void test_int3_handler(struct interrupt_frame *frame)
 
 static void test_ipi_handler(struct interrupt_frame *frame)
 {
-    (void)frame;
+    test_ipi_ctx = irq_vector_ctx(frame->vector);
     test_ipi_count++;
     lapic_eoi();
 }
+
+/// Contexts for the vector-allocator tests.
+static int ctx_a, ctx_b;
+
+/// Scratch for the exhaustion test.
+static int got_vectors[IRQ_DYN_COUNT];
 
 static volatile uint64_t recover_rip;
 static volatile int      pf_count;
@@ -152,26 +160,85 @@ uint32_t test_interrupts(void)
                     "LAPIC timer stops");
     }
 
-    // ── Self-IPIs and EOI ───────────────────────────────
+    // ── Vector allocator ────────────────────────────────
     {
-        idt_set_handler(TEST_IPI_VECTOR, test_ipi_handler);
-        test_ipi_count = 0;
+        int free0 = irq_vectors_free();
+        TEST_ASSERT_EQ(free0, IRQ_DYN_COUNT,
+                       "all dynamic vectors free before drivers");
 
-        lapic_send_ipi(lapic_id(), TEST_IPI_VECTOR);
+        int a = irq_alloc_vector(test_ipi_handler, &ctx_a);
+        int b = irq_alloc_vector(test_ipi_handler, &ctx_b);
+        TEST_ASSERT(a >= IRQ_DYN_FIRST && a <= IRQ_DYN_LAST,
+                    "vector in dynamic range");
+        TEST_ASSERT(b >= IRQ_DYN_FIRST && b <= IRQ_DYN_LAST && b != a,
+                    "second vector distinct and in range");
+        TEST_ASSERT_EQ(irq_vectors_free(), free0 - 2,
+                       "free count drops by 2");
+        TEST_ASSERT(irq_vector_ctx(a) == &ctx_a
+                 && irq_vector_ctx(b) == &ctx_b,
+                   "per-vector context recorded");
+        TEST_ASSERT(irq_vector_ctx(APIC_WAKE_VECTOR) == NULL,
+                    "fixed vectors have no context");
+        TEST_ASSERT_EQ(irq_alloc_vector(NULL, NULL), -1,
+                       "NULL handler rejected");
+
+        // Exhaust the range
+        int n = 0;
+        bool ok = true;
+        int v;
+        while (n < IRQ_DYN_COUNT
+               && (v = irq_alloc_vector(test_ipi_handler, NULL)) >= 0)
+        {
+            if (v < IRQ_DYN_FIRST || v > IRQ_DYN_LAST || v == a || v == b
+                || (n > 0 && v <= got_vectors[n - 1]))
+                ok = false;
+            got_vectors[n++] = v;
+        }
+        TEST_ASSERT_EQ(n, free0 - 2,
+                       "allocates exactly the remaining vectors");
+        TEST_ASSERT(ok, "vectors unique and within 64-239");
+        TEST_ASSERT_EQ(irq_alloc_vector(test_ipi_handler, NULL), -1,
+                       "exhausted range fails");
+        for (int i = 0; i < n; ++i)
+            irq_free_vector(got_vectors[i]);
+
+        // Lowest-first allocation reuses a freed vector
+        irq_free_vector(a);
+        TEST_ASSERT(irq_vector_ctx(a) == NULL,
+                    "freed vector loses its context");
+        TEST_ASSERT_EQ(irq_alloc_vector(test_ipi_handler, &ctx_a), a,
+                       "freed vector is reused");
+        irq_free_vector(a);
+        irq_free_vector(b);
+        irq_free_vector(b);  // double free should be harmless
+        irq_free_vector(IRQ_DYN_LAST + 1);  // out of range; ignored
+        TEST_ASSERT_EQ(irq_vectors_free(), free0, "all vectors returned");
+    }
+
+    // ── Self-IPIs on an allocated vecttor, and EOI ──────
+    {
+        int vec = irq_alloc_vector(test_ipi_handler, &ctx_b);
+        TEST_ASSERT(vec >= 0, "vector allocated for self-IPI test");
+        test_ipi_count = 0;
+        test_ipi_ctx = NULL;
+
+        lapic_send_ipi(lapic_id(), (uint8_t)vec);
         WAIT_FOR(test_ipi_count == 1);
-        lapic_send_ipi(lapic_id(), TEST_IPI_VECTOR);
+        TEST_ASSERT(test_ipi_ctx == &ctx_b,
+                    "handler sees its vector's context");
+        lapic_send_ipi(lapic_id(), (uint8_t)vec);
         WAIT_FOR(test_ipi_count == 2);
         TEST_ASSERT_EQ(test_ipi_count, 2, "self-IPI delivered twice");
 
-        // A wake IPI must be acknowledged
+        // service, every lower-priority vector would be blocked
         lapic_send_ipi(lapic_id(), APIC_WAKE_VECTOR);
         tsc_delay_us(1000);
-        lapic_send_ipi(lapic_id(), TEST_IPI_VECTOR);
+        lapic_send_ipi(lapic_id(), (uint8_t)vec);
         WAIT_FOR(test_ipi_count == 3);
         TEST_ASSERT_EQ(test_ipi_count, 3,
                        "interrupts still delivered after a wake IPI");
     
-        idt_set_handler(TEST_IPI_VECTOR, NULL);
+        irq_free_vector(vec);
     }
 
     // ── Read-only pages are enforced in ring 0 (CR0.WP)
