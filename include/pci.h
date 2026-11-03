@@ -8,7 +8,7 @@
  *
  * @par PCI Configuration Space (256 bytes per function)
  * Accessed via a 32-bit address written to port @c 0xCF8:
- * @code
+ * @code{.txt}
  *   Bit 31:      Enable
  *   Bits 23:16:  Bus      (0–255)
  *   Bits 15:11:  Device   (0–31)
@@ -18,16 +18,28 @@
  * @endcode
  * Data is read / written via port @c 0xCFC.
  *
- * @par Enumeration
+ * @par Enumeration and drivers
  * @c pci_init() scans all buses / devices / functions and populates an
- * internal device table. Drivers then look up devices by vendor / device
- * ID or class code.
+ * internal device table, then offers every device to the registered
+ * drivers (@c pci_register_driver()): a driver's @c probe is called for
+ * every device whose ID matches its table — every instance, not just the
+ * first. A driver registered after @c pci_init() is offered the
+ * still-unbound devices immediately.
+ *
+ * @par Interrupts
+ * @c pci_msix_alloc() enables MSI-X and gives each requested table entry
+ * its own IDT vector from the kernel allocator (@c irq.h); drivers never
+ * hard-code vector numbers.
+ *
+ * TODO: legacy CF8/CFC access reaches only the first 256 bytes of config
+ * space; PCIe extended capabilities need ECAM.
  */
 
 #ifndef EMMK_PCI_H
 #define EMMK_PCI_H
 
 #include "types.h"
+#include "idt.h"
 
 /// @name PCI I/O ports
 /// @{
@@ -163,9 +175,54 @@ struct msix_entry
 #define MSIX_ENTRY_MASKED  (1 << 0)
 /// @}
 
-/// @name Device table limits
+/// @name Table limits
 /// @{
-#define PCI_MAX_DEVICES  64
+#define PCI_MAX_DEVICES       64  ///< Enumerated functions.
+#define PCI_MAX_DRIVERS       8   ///< Registered drivers.
+
+/// MSI-X entries @c pci_msix_alloc() can set up per device.
+#define PCI_MSIX_MAX_VECTORS  32
+/// @}
+
+/// @name Driver model
+/// @{
+
+/// Wildcard for @c pci_device_id fields.
+#define PCI_ANY_ID  0xFFFF
+
+/**
+ * @brief One entry of a driver's ID table.
+ *
+ * A table is terminated by an entry with `vendor == 0`.
+ */
+struct pci_device_id
+{
+    uint16_t vendor;  ///< Vendor ID, or @c PCI_ANY_ID.
+    uint16_t device;  ///< Device ID, or @c PCI_ANY_ID.
+};
+
+struct pci_device;
+
+/**
+ * @brief A PCI device driver.
+ *
+ * Registered with @c pci_register_driver(). The PCI layer calls @c probe
+ * once per matching, not yet bound device. ID table is terminated by
+ * `vendor == 0`.
+ */
+struct pci_driver
+{
+    const char *name;                 ///< Driver name (for logs).
+    const struct pci_device_id *ids;  ///< ID table.
+
+    /**
+     * Take over @p dev. Return @c 0 to bind the device to this driver,
+     * negative to decline (the device stays available to other drivers).
+     * A driver that fails must leave the device as it found it apart
+     * from config-space state (it may have reset or enabled the device).
+     */
+    int (*probe)(struct pci_device *dev);
+};
 /// @}
 
 /// @name PCI device structure
@@ -202,16 +259,23 @@ struct pci_device
         bool     is_io;        ///< I/O space (vs memory).
         bool     is_64bit;     ///< 64-bit BAR (consumes next BAR slot).
         bool     is_prefetch;  ///< Memory is prefetchable.
+        void    *virt;         ///< Mapping made by @c pci_map_bar().
     } bar[6];
 
-    // Capability offsets (0 = not present)
+    // Capability offsets (0 = not present). These record the first
+    // instance only; use pci_find_next_capability() to walk all of them
     uint8_t  cap_msi;
     uint8_t  cap_msix;
     uint8_t  cap_vendor;
 
     // MSI-X state (populated if cap_msix != 0)
-    uint16_t msix_count;                     ///< Number of MSI-X vectors.
+    uint16_t msix_count;                     ///< Table size.
     volatile struct msix_entry *msix_table;  ///< Virtual address of MSI-X table.
+    uint16_t msix_allocated; ///< Entries set up by @c pci_msix_alloc().
+    uint8_t  msix_vectors[PCI_MSIX_MAX_VECTORS];  ///< IDT vector of each allocated entry.
+
+    /// Driver bound by the probe loop, or @c NULL.
+    const struct pci_driver *driver;
 
     /// Opaque pointer for the owning driver.
     void *driver_data;
@@ -268,7 +332,14 @@ static inline void pci_device_write32(struct pci_device *dev, uint8_t offset, ui
 /// @name Initialization and enumeration
 /// @{
 
-/// Scan all PCI buses and populate the device table.
+/**
+ * @brief Scan all PCI buses, populate the device table, and probe drivers.
+ *
+ * BARs are sized with I/O and memory decode disabled in @c COMMAND (and
+ * the previous @c COMMAND value restored), so the all-ones sizing write
+ * can never make a BAR decode a bogus address range. After enumeration,
+ * every registered driver is offered every matching device.
+ */
 void pci_init(void);
 
 /// @return The number of devices found during enumeration.
@@ -310,6 +381,37 @@ struct pci_device *pci_find_class(uint8_t class_code, uint8_t subclass,
                                   struct pci_device *from);
 /// @}
 
+/// @name Driver registry
+/// @{
+
+/**
+ * @brief Register a PCI driver.
+ *
+ * Before @c pci_init(), the driver is only recorded; @c pci_init() probes
+ * it. After @c pci_init(), the driver is offered every matching device
+ * that is not yet bound, immediately.
+ *
+ * @param drv  Driver (must stay valid while registered).
+ * @return Number of devices bound by this call, or @c -1 if @p drv is
+ *         invalid, already registered, or the registry is full.
+ */
+int pci_register_driver(const struct pci_driver *drv);
+
+/**
+ * @brief Remove a driver from the registry.
+ *
+ * Devices bound to it are marked unbound.
+ */
+void pci_unregister_driver(const struct pci_driver *drv);
+
+/**
+ * @brief Check @p dev against a driver ID table.
+ * @return @c true if any entry of @p ids matches.
+ */
+bool pci_match_id(const struct pci_device_id *ids,
+                  const struct pci_device *dev);
+/// @}
+
 /// @name Device configuration
 /// @{
 
@@ -336,6 +438,26 @@ void pci_enable_bus_master(struct pci_device *dev);
  * @return Config space offset of the capability, or @c 0 if not found.
  */
 uint8_t pci_find_capability(struct pci_device *dev, uint8_t cap_id);
+
+/**
+ * @brief Find the next instance of a capability.
+ *
+ * Some devices carry several capabilities with the same ID.
+ *
+ * @param dev     PCI device.
+ * @param cap_id  Capability ID to find.
+ * @param prev    Offset of the previous match, or @c 0 to start at the
+ *                head of the list.
+ * @return Config space offset of the next match, or @c 0 if none.
+ *
+ * @code{.c}
+ *   for (uint8_t c = pci_find_next_capability(dev, PCI_CAP_VENDOR, 0); c;
+ *        c = pci_find_next_capability(dev, PCI_CAP_VENDOR, c))
+ *       // inspect the capability at c
+ * @endcode
+ */
+uint8_t pci_find_next_capability(struct pci_device *dev, uint8_t cap_id,
+                                 uint8_t prev);
 /// @}
 
 /// @name BAR access
@@ -359,6 +481,19 @@ uint64_t pci_get_bar_address(struct pci_device *dev, int bar);
  * @return Region size in bytes.
  */
 uint64_t pci_get_bar_size(struct pci_device *dev, int bar);
+
+/**
+ * @brief Map a memory BAR uncached (via @c vmm_map_mmio()).
+ *
+ * The whole BAR is mapped once; later calls return the same mapping.
+ *
+ * @param dev  PCI device.
+ * @param bar  BAR index (0-5).
+ * @return Virtual address of the BAR's first byte, or @c NULL for an
+ *         I/O BAR, an unimplemented BAR (or the upper half of a 64-bit
+ *         BAR), or a mapping failure.
+ */
+void *pci_map_bar(struct pci_device *dev, int bar);
 /// @}
 
 /// @name MSI-X configuration
@@ -368,11 +503,41 @@ uint64_t pci_get_bar_size(struct pci_device *dev, int bar);
  * @brief Enable MSI-X for a @p dev.
  *
  * Maps the MSI-X table, enables MSI-X in the message control register,
- * and disables legacy INTx. All vectors start masked.
+ * and disables legacy INTx. All entries start masked. Calling it again
+ * on an enabled device does nothing.
+ *
+ * Most drivers call @c pci_msix_alloc() instead, which enables MSI-X
+ * as needed.
  *
  * @return @c 0 on success, negative on failure.
  */
 int pci_msix_enable(struct pci_device *dev);
+
+/**
+ * @brief Enable MSI-X and give entries 0, ..., @p n - 1 their own vectors.
+ *
+ * Allocates @p n vectors from the kernel allocator
+ * (@c irq_alloc_vector()), all with @p handler and @p ctx, programs entry
+ * @e i with vector @c dev->msix_vectors[i], targets the calling core's
+ * LAPIC, and unmasks the entries. Retarget an entry with
+ * `pci_msix_set_entry(dev, i, dev->msix_vectors[i], apic_id)`.
+ *
+ * @param dev
+ * @param n
+ * @param handler
+ * @param ctx
+ * @return @c 0 on success; @c -1 on failure (no MSI-X, @p n out of range,
+ *         already allocated, or vectors exhausted), in which case nothing
+ *         stays allocated.
+ */
+int pci_msix_alloc(struct pci_device *dev, uint16_t n,
+                   interrupt_handler_t handler, void *ctx);
+
+/**
+ * @brief Mask the entries set up by @c pci_msix_alloc() and release
+ *        their vectors.
+ */
+void pci_msix_free(struct pci_device *dev);
 
 /**
  * @brief Program a single MSI-X table entry.

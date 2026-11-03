@@ -12,6 +12,8 @@
 #include "netdev.h"
 #include "endian.h"
 #include "smp.h"
+#include "heap.h"
+#include "format.h"
 
 // Dummy handler for UDP bind tests
 static void udp_test_handler(struct netbuf *nb) { netbuf_free(nb); }
@@ -254,8 +256,95 @@ uint32_t test_net(void)
         }
         else
             kprintf("  single-core: TX handoff test skipped\n");
-    
+
+        // ── Connected-subnet routing across several devices
+        struct netdev *fake1 = netdev_alloc("fake1");
+        TEST_ASSERT(fake1 != NULL, "second fake netdev allocated");
+        if (fake1)
+        {
+            fake1->ops = &fake_ok_ops;
+            netdev_register(fake1);
+            netdev_set_up(fake1);
+            netdev_set_ip(fake1, IP4_ADDR(10, 8, 8, 2),
+                          IP4_ADDR(255, 255, 255, 0),
+                          IP4_ADDR(10, 8, 8, 1));
+        
+            struct netdev *out = NULL;
+            uint32_t hop = 0;
+            TEST_ASSERT(ip_route(IP4_ADDR(10, 9, 9, 7), &out, &hop) == 0
+                        && out == fake && hop == IP4_ADDR(10, 9, 9, 7),
+                        "on-link route picks fake0");
+            TEST_ASSERT(ip_route(IP4_ADDR(10, 8, 8, 7), &out, &hop) == 0
+                        && out == fake1 && hop == IP4_ADDR(10, 8, 8, 7),
+                        "on-link route picks fake1");
+            TEST_ASSERT(ip_route(IP4_ADDR(1, 2, 3, 4), &out, &hop) == 0
+                        && out == fake1 && hop == IP4_ADDR(10, 8, 8, 1),
+                        "off-link route uses the device with a gateway");
+            TEST_ASSERT(ip_route(IP4_ADDR(10, 8, 8, 255), &out, &hop) == 0
+                        && out == fake1,
+                        "directed broadcast goes out its subnet's device");
+            TEST_ASSERT(ip_is_local(IP4_ADDR(10, 8, 8, 2)),
+                        "second device's address is local");
+            TEST_ASSERT(!ip_is_local(IP4_ADDR(10, 8, 8, 3)),
+                        "other address on its subnet is not local");
+        
+            // A device that is down is not routed to
+            netdev_set_down(fake1);
+            TEST_ASSERT(ip_route(IP4_ADDR(10, 8, 8, 7), &out, &hop) != 0,
+                        "down device is not used");
+            netdev_unregister(fake1);
+            kfree(fake1);
+        }
+
         netdev_unregister(fake);
+    }
+
+    // ── Default names: lowest free ethN ─────────────────
+    {
+        int eth = 0;
+        while (eth < NETDEV_MAX)
+        {
+            char name[16];
+            ksnprintf(name, sizeof(name), "eth%d", eth);
+            if (!netdev_find(name))
+                break;
+            eth++;
+        }
+
+        char name_a[16], name_b[16];
+        ksnprintf(name_a, sizeof(name_a), "eth%d", eth);
+        ksnprintf(name_b, sizeof(name_b), "eth%d", eth + 1);
+
+        struct netdev *a = netdev_alloc(NULL);
+        struct netdev *b = netdev_alloc(NULL);
+        struct netdev *c = netdev_alloc(NULL);
+        TEST_ASSERT(a && b && c, "unnamed netdevs allocated");
+        if (a && b && c)
+        {
+            TEST_ASSERT_EQ(netdev_register(a), 0,
+                           "unnamed netdev registers");
+            TEST_ASSERT_EQ(netdev_register(b), 0,
+                           "second unnamed netdev registers");
+            TEST_ASSERT_STREQ(a->name, name_a, "gets the next free ethN");
+            TEST_ASSERT_STREQ(b->name, name_b, "then the one after");
+        
+            // Unregistering frees name
+            netdev_unregister(a);
+            TEST_ASSERT_EQ(netdev_register(c), 0,
+                           "third unnamed netdev registers");
+            TEST_ASSERT_STREQ(c->name, name_a, "lowest freed name reused");
+
+            // Registering under a live name fails
+            strlcpy(a->name, name_b, sizeof(a->name));
+            TEST_ASSERT_EQ(netdev_register(a), -1,
+                           "duplicate name rejected");
+
+            netdev_unregister(b);
+            netdev_unregister(c);
+        }
+        kfree(a);
+        kfree(b);
+        kfree(c);
     }
 
     TEST_END();

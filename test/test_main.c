@@ -129,13 +129,6 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
     // ── v0.1.1 ──────────────────────────────────────────
     failures += test_smp();
 
-    // ── Initialize PCI ──────────────────────────────────
-    pci_init();
-    kprintf("\n");
-
-    // ── v0.0.4 ──────────────────────────────────────────
-    failures += test_pci_net();
-
     // ── Initialize network stack ────────────────────────
     netbuf_init();
     netdev_init();
@@ -144,6 +137,13 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
     icmp_init();
     udp_init();
     kprintf("\n");
+
+    virtio_net_register();
+    pci_init();
+    kprintf("\n");
+
+    // ── v0.0.4 ──────────────────────────────────────────
+    failures += test_pci_net();
 
     // ── v0.0.5 ──────────────────────────────────────────
     failures += test_netbuf();

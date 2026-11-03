@@ -149,9 +149,13 @@ void dispatch_rx(void)
     if (!dev)
         return;
 
-    struct netbuf *nb;
-    while ((nb = netbuf_queue_pop(&dev->rx_queue)) != NULL)
-        dispatch_one(nb);
+    for (int i = 0; i < netdev_count(); ++i)
+    {
+        struct netdev *dev = netdev_get(i);
+        struct netbuf *nb;
+        while ((nb = netbuf_queue_pop(&dev->rx_queue)) != NULL)
+            dispatch_one(nb);
+    }
 
     // Transmit replies the workers handed back
     ip_tx_drain();

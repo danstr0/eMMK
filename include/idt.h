@@ -5,7 +5,8 @@
  * The x86-64 IDT has 256 entries, each a 16-byte gate descriptor:
  * - Vectors 0–31:    CPU exceptions (divide error, page fault, etc.)
  * - Vectors 32–47:   Legacy PIC IRQs (remapped from 0–15)
- * - Vectors 48–255:  Available for MSI, APIC, software interrupts
+ * - Vectors 48–255:  APIC vectors; 64-239 are handed out to devices by
+ *                    @c irq_alloc_vector()
  *
  * Each gate descriptor contains the handler address (split across three
  * fields), the code segment selector, gate type, DPL, and an optional

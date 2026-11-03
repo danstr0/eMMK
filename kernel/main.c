@@ -3,8 +3,9 @@
  * @brief Kernel entry point (C side).
  *
  * Initializes all subsystems in dependency order, brings up all CPU
- * cores, wires up the virtio-net driver to the network stack, and
- * enters the main run-to-completion poll loop.
+ * cores, probes PCI drivers (every virtio-net NIC becomes a netdev),
+ * configures IPv4 on each NIC, and enters the main run-to-completion
+ * poll loop.
  *
  * @par Build modes
  * - Default: single-core poll loop
@@ -87,65 +88,19 @@ static void print_memory_map(struct multiboot2_tag_mmap *mmap)
     }
 }
 
-// ── Virtio-net ↔ netdev glue ───────────────────────────────────────────
+// ── Network configuration ──────────────────────────────────────────────
 
-/**
- * @brief @c netdev_ops.send adapter for virtio-net.
- *
- * Extracts the raw frame from the @c netbuf, passes it to @c virtio_net_send
- * (which copies the data into its own DMA buffer), then frees the
- * @c netbuf. The driver always takes ownership of @p nb.
- */
-static int virtio_netdev_send(struct netdev *dev, struct netbuf *nb)
+/// Give every virtio-net device its IPv4 address.
+static void net_configure(void)
 {
-    struct virtio_net_dev *vdev = (struct virtio_net_dev *)dev->priv;
-    int ret = virtio_net_send(vdev, nb->data, nb->len);
-    netbuf_free(nb);
-    return ret;
-}
-
-/**
- * @brief @c netdev_ops.poll adapter for virtio-net.
- *
- * Calls @c virtio_net_poll, which invokes the RX callback for each
- * completed packet.
- */
-static void virtio_netdev_poll(struct netdev *dev)
-{
-    struct virtio_net_dev *vdev = (struct virtio_net_dev *)dev->priv;
-    virtio_net_poll(vdev);
-}
-
-static const struct netdev_ops virtio_netdev_ops =
-{
-    .send = virtio_netdev_send,
-    .poll = virtio_netdev_poll,
-};
-
-/**
- * @brief virtio-net RX callback.
- *
- * Called inline by @c virtio_net_poll for each completed RX buffer.
- * Allocates a @c netbuf, copies the packet data, and queues it for
- * stack processing via @c netdev_receive().
- */
-static void virtio_rx_callback(const void *data, size_t len, void *ctx)
-{
-    struct netdev *dev = (struct netdev *)ctx;
-
-    struct netbuf *nb = netbuf_alloc(0);
-    if (!nb)
-        return;
-
-    void *p = netbuf_put(nb, len);
-    if (!p)
+    for (int i = 0; i < virtio_net_count(); ++i)
     {
-        netbuf_free(nb);
-        return;
+        struct netdev *dev = virtio_net_get(i)->netdev;
+        netdev_set_ip(dev,
+                      IP4_ADDR(10, 0, 2 + i, 15),
+                      IP4_ADDR(255, 255, 255, 0),
+                      IP4_ADDR(10, 0, 2 + i, 2));
     }
-    memcpy(p, data, len);
-
-    netdev_receive(dev, nb);
 }
 
 // ── Demo: UDP echo handler ─────────────────────────────────────────────
@@ -315,12 +270,6 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     kprintf("\n");
     smp_init();
 
-    // ── PCI and virtio-net ──────────────────────────────
-    kprintf("\n");
-    pci_init();
-    kprintf("\n");
-    struct virtio_net_dev *vnet = virtio_net_init();
-
     // ── Network stack ───────────────────────────────────
     kprintf("\n");
     netbuf_init();
@@ -329,33 +278,13 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     ip_init();
     icmp_init();
     udp_init();
- 
-    // Wire virtio-net into the netdev abstraction
-    struct netdev *eth0 = NULL;
-    if (vnet)
-    {
-        eth0 = netdev_alloc("eth0");
-        if (eth0)
-        {
-            memcpy(eth0->mac, vnet->mac, 6);
-            eth0->ops  = &virtio_netdev_ops;
-            eth0->priv = vnet;
-            netdev_register(eth0);
-            netdev_set_up(eth0);
 
-            // QEMU user mode network:
-            //   - guest=10.0.2.15
-            //   - gw=10.0.2.2
-            netdev_set_ip(eth0,
-                          IP4_ADDR(10, 0, 2, 15),
-                          IP4_ADDR(255, 255, 255, 0),
-                          IP4_ADDR(10, 0, 2, 2));
-
-            // Register the RX callback so virtio_net_poll feeds
-            // packets into the network stack
-            virtio_net_set_rx_callback(vnet, virtio_rx_callback, eth0);
-        }
-    }
+    // ── PCI and drivers ─────────────────────────────────
+    kprintf("\n");
+    virtio_net_register();
+    pci_init();
+    kprintf("\n");
+    net_configure();
 
     // ── Summary ─────────────────────────────────────────
     struct pmm_stats ps;
@@ -375,10 +304,14 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
     kprintf("[SUMMARY] Clock: TSC %lu MHz, tickless, uptime %lu ms\n",
             tsc_get_freq() / 1000000, timer_get_ms());
 
-    if (eth0)
-        kprintf("[SUMMARY] Network: %s  MAC=%s IP=%s\n",
-                eth0->name, ETH_FMT(eth0->mac), IP4_FMT(eth0->ip_addr));
-    else
+    for (int i = 0; i < virtio_net_count(); ++i)
+    {
+        struct virtio_net_dev *vnet = virtio_net_get(i);
+        kprintf("[SUMMARY] Network: %s  MAC=%s IP=%s vector=%u\n",
+                vnet->netdev->name, ETH_FMT(vnet->mac),
+                IP4_FMT(vnet->netdev->ip_addr), vnet->irq_vector);
+    }
+    if (virtio_net_count() == 0)
         kprintf("[SUMMARY] Network: no device\n");
 
     kprintf("\nBoot complete.\n");
@@ -435,13 +368,19 @@ non_demo:
     // Default: single-core poll loop
     // ══════════════════════════════
 
-    // ── Test ping to the gateway ────────────────────────
-    if (eth0)
+    // ── Test ping to every NIC's gateway ────────────────
+    if (virtio_net_count() > 0)
     {
-        kprintf("\n[PING] Sending echo request to gateway...\n");
-        icmp_send_echo_request(IP4_ADDR(10, 0, 2, 2), 1, 1, "eMMK", 4);
+        for (int i = 0; i < virtio_net_count(); ++i)
+        {
+            struct netdev *dev = virtio_net_get(i)->netdev;
+            kprintf("\n[PING] %s: sending echo request to gateway...\n",
+                    dev->name);
+            icmp_send_echo_request(dev->gateway, 1, (uint16_t)(i + 1),
+                                   "eMMK", 4);
+        }
 
-        // Poll for a reply
+        // Poll for the replies
         for (int i = 0; i < 500; ++i)
         {
             netdev_poll_all();

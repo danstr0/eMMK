@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "string.h"
 #include "heap.h"
+#include "format.h"
 
 // ── Device table ───────────────────────────────────────────────────────
 
@@ -48,15 +49,20 @@ int netdev_register(struct netdev *dev)
         return -1;
     }
 
-    // Assign a default name if none was provided
+    // Assign the lowest free ethN if no name was provided
     if (dev->name[0] == '\0')
+        for (int n = 0; n < NETDEV_MAX; ++n)
+        {
+            ksnprintf(dev->name, sizeof(dev->name), "eth%d", n);
+            if (!netdev_find(dev->name))
+                break;
+        }
+
+    if (netdev_find(dev->name))
     {
-        // Simple single-digit scheme; safe because NETDEV_MAX < 10
-        dev->name[0] = 'e';
-        dev->name[1] = 't';
-        dev->name[2] = 'h';
-        dev->name[3] = '0' + (char)device_count;
-        dev->name[4] = '\0';
+        kprintf("[NETDEV] Registration failed: %s already exists\n",
+                dev->name);
+        return -1;
     }
 
     netbuf_queue_init(&dev->rx_queue);
@@ -109,6 +115,18 @@ struct netdev *netdev_find(const char *name)
 struct netdev *netdev_get_default(void)
 {
     return device_count > 0 ? devices[0] : NULL;
+}
+
+int netdev_count(void)
+{
+    return device_count;
+}
+
+struct netdev *netdev_get(int index)
+{
+    if (index < 0 || index >= device_count)
+        return NULL;
+    return devices[index];
 }
 
 // ── Data path - transmit ───────────────────────────────────────────────
