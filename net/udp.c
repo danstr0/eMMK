@@ -262,10 +262,13 @@ int udp_output(struct netbuf *nb, uint32_t dst_ip,
     udp->len      = htons(udp_len);
     udp->checksum = 0;
 
-    // Compute the checksum. The source IP comes from the outgoing
-    // device; ip_output() will fill in the actual IP header field.
-    struct netdev *dev = netdev_get_default();
-    uint32_t src_ip = dev ? dev->ip_addr : 0;
+    // Compute the checksum. The source IP is that of the outgoing device
+    // (the one ip_output() will route to); ip_output() fills in the
+    // actual IP header field.
+    struct netdev *dev;
+    uint32_t next_hop;
+    uint32_t src_ip = ip_route(dst_ip, &dev, &next_hop) == 0 ? dev->ip_addr
+                                                             : 0;
 
     uint16_t csum = udp_checksum(udp, udp_len,
                                  htonl(src_ip), htonl(dst_ip));
