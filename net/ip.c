@@ -71,12 +71,13 @@ bool ip_is_local(uint32_t ip)
     if ((ip >> 24) == 127)
         return true;
 
-    // Check the default device. Since eMMK is currently single-NIC
-    // this is sufficient - if support for multi-NIC is added, iterate
-    // all registered netdevs.
-    struct netdev *dev = netdev_get_default();
-    if (dev && dev->ip_addr != 0 && dev->ip_addr == ip)
-        return true;
+    // Any device's address (weak host model)
+    for (int i = 0; i < netdev_count(); ++i)
+    {
+        struct netdev *dev = netdev_get(i);
+        if (dev->ip_addr != 0 && dev->ip_addr == ip)
+            return true;
+    }
 
     return false;
 }
@@ -101,33 +102,52 @@ bool ip_is_broadcast(uint32_t ip, struct netdev *dev)
 
 // ── Routing ────────────────────────────────────────────────────────────
 
+/// A device can carry IP traffic: up and addressed.
+static bool ip_dev_usable(struct netdev *dev)
+{
+    return netdev_is_up(dev) && dev->ip_addr != 0;
+}
+
 int ip_route(uint32_t dst_ip, struct netdev **dev, uint32_t *next_hop)
 {
-    struct netdev *out_dev = netdev_get_default();
-    if (!out_dev || out_dev->ip_addr == 0)
-        return -1;
+    struct netdev *first   = NULL;  // first usable device
+    struct netdev *gateway = NULL;  // first usable device with a gateway
 
-    *dev = out_dev;
-
-    // Broadcast: deliver directly
-    if (ip_is_broadcast(dst_ip, out_dev))
+    for (int i = 0; i < netdev_count(); ++i)
     {
+        struct netdev *d = netdev_get(i);
+        if (!ip_dev_usable(d))
+            continue;
+    
+        if (!first)
+            first = d;
+        if (!gateway && d->gateway != 0)
+            gateway = d;
+    
+        // On-link, or this subnet's directed broadcast: deliver directly
+        if (dst_ip != 0xFFFFFFFF
+            && (ip_is_broadcast(dst_ip, d)
+                || (dst_ip & d->netmask) == (d->ip_addr & d->netmask)))
+        {
+            *dev = d;
+            *next_hop = dst_ip;
+            return 0;
+        }
+    }
+
+    // Limited broadcast: out the first device
+    if (dst_ip == 0xFFFFFFFF && first)
+    {
+        *dev = first;
         *next_hop = dst_ip;
         return 0;
     }
 
-    // On-link: destination is on this host's subnet
-    if ((dst_ip & out_dev->netmask)
-        == (out_dev->ip_addr & out_dev->netmask))
+    // Off-link: the first default gateway
+    if (gateway)
     {
-        *next_hop = dst_ip;
-        return 0;
-    }
-
-    // Off-link: use the default gateway
-    if (out_dev->gateway != 0)
-    {
-        *next_hop = out_dev->gateway;
+        *dev = gateway;
+        *next_hop = gateway->gateway;
         return 0;
     }
 

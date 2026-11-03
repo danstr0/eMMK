@@ -6,7 +6,7 @@
  * and basic routing (local subnet vs gateway).
  *
  * @par IPv4 header (20 bytes minimum, no options)
- * @code
+ * @code{.txt}
  *   0               1               2               3
  *   0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
  *  ┏━━━━━━━┯━━━━━━━┯━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -203,8 +203,16 @@ uint16_t ip_checksum(const void *data, size_t len);
  * @param[out] dev       Outgoing network device.
  * @param[out] next_hop  Next-hop IP for ARP resolution (may be the gateway).
  *
- * If @p dst_ip is on the local subnet, @p next_hop = @p dst_ip.
- * Otherwise, @p next_hop = default gateway.
+ * Only devices that are up and have an IP address are considered, in
+ * registration order:
+ * 1. @c 255.255.255.255 goes out the first such device; a subnet-directed
+ *    broadcast out the device whose subnet it is.
+ * 2. On-link: the first device whose subnet contains @p dst_ip
+ *    (@p next_hop = @p dst_ip).
+ * 3. Otherwise the first device with a gateway (@p next_hop = gateway).
+ *
+ * This is connected-subnet routing for multiple NICs; TODO: routing table
+ * work to come.
  *
  * @return @c 0 on success, @c -1 if no route (no device or no gateway).
  */
