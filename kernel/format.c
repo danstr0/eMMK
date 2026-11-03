@@ -239,7 +239,7 @@ size_t kvformat(format_sink_t sink, void *ctx,
                 spec.length = LEN_LONG;
                 break;
             default:
-            break;
+                break;
         }
 
         // Conversion
@@ -268,14 +268,14 @@ size_t kvformat(format_sink_t sink, void *ctx,
             uint64_t v;
             switch(spec.length)
             {
-                case LEN_CHAR:  v = (unsigned char)__builtin_va_arg(args, unsigned);
-                                break;
-                case LEN_SHORT: v = (unsigned short)__builtin_va_arg(args, unsigned);
-                                break;
-                case LEN_LONG:  v = __builtin_va_arg(args, unsigned long);
-                                break;
-                default:        v = __builtin_va_arg(args, unsigned);
-                                break;
+            case LEN_CHAR:  v = (unsigned char)__builtin_va_arg(args, unsigned);
+                            break;
+            case LEN_SHORT: v = (unsigned short)__builtin_va_arg(args, unsigned);
+                            break;
+            case LEN_LONG:  v = __builtin_va_arg(args, unsigned long);
+                            break;
+            default:        v = __builtin_va_arg(args, unsigned);
+                            break;
             }
             
             unsigned base = (*fmt == 'u') ? 10 : (*fmt == 'o') ? 8 : 16;
