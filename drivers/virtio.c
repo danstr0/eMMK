@@ -655,6 +655,9 @@ void virtqueue_disable_interrupts(struct virtqueue *vq)
 void virtqueue_enable_interrupts(struct virtqueue *vq)
 {
     vq->avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
-    virtio_wmb();
+
+    // The flag must be visible before the caller's final look at the
+    // used ring
+    virtio_mb();
 }
 

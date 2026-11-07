@@ -8,7 +8,7 @@
  * @par Architecture
  * @code{.txt}
  *   ┌─────────────┐     ┌───────────┐     ┌──────────────┐
- *   │ virtio-net  │────▶│ rx_queue  │────▶│ distributor  │
+ *   │ virtio-net  │────▶│ rx_burst  │────▶│ distributor  │
  *   │ (poll)      │     │ (netdev)  │     │ (core 0)     │
  *   └─────────────┘     └───────────┘     └──┬───┬───┬───┘
  *                                            │   │   │

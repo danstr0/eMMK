@@ -8,21 +8,22 @@
  * 2. Negotiate features (VERSION_1, MAC, STATUS) with FEATURES_OK, and
  *    read the MAC.
  * 3. Interrupt: one MSI-X entry with a vector from the kernel allocator
- *    (or the shared legacy INTx line as a fallback). Before the queues:
- *    each queue's MSI-X entry is programmed when it is created.
- * 4. Create RX and TX virtqueues and pre-fill RX with empty buffers.
+ *    (or the shared INTx line as a fallback). Before the queues: each
+ *    queue's MSI-X entry is programmed when it is created.
+ * 4. Create RX and TX virtqueues, suppress their interrupts, create the
+ *    RX queue's netbuf pool, and fill the ring from it.
  * 5. Set DRIVER_OK — the device is live.
  * 6. Register a @c netdev (@c eth0, @c eth1, ...) for it.
  *
  * @par Transmit path
- * Allocate a page, copy @c virtio_net_hdr + packet data, add to the TX
- * queue, and kick. Completed TX buffers are freed during poll or the
- * next send.
+ * @c tx_burst writes a zeroed @c virtio_net_hdr into the headroom just
+ * below the frame, posts the netbuf itself, and rings one doorbell.
+ * Completed netbufs are freed by the next @c tx_burst.
  *
  * @par Receive path
- * Pre-filled RX buffers are completed by the device. On poll, the driver
- * copies each frame into a @c netbuf, hands it to @c netdev_receive(),
- * and refills the buffer slot.
+ * The ring holds netbufs from the queue's pool; the device writes header
+ * + frame straight into them. @c rx_burst hands those same netbufs to the
+ * caller and refills the ring from the pool with one doorbell.
  */
 
 #include "virtio_net.h"
@@ -40,6 +41,7 @@
 #include "netbuf.h"
 #include "netdev.h"
 #include "ethernet.h"
+#include "smp.h"
 
 // ── Instance table ─────────────────────────────────────────────────────
 
@@ -50,89 +52,6 @@ static int instance_count = 0;
 /// Vector allocated for each INTx line (0 = none yet). Several devices
 /// may share one line; its handler acknowledges all of them.
 static uint8_t intx_vectors[16];
-
-// ── RX buffer management ───────────────────────────────────────────────
-
-/**
- * @brief Refill a single RX buffer slot.
- *
- * @param dev   Virtio-net device.
- * @param virt  Virtual address of the buffer.
- * @param phys  Physical address of the buffer.
- * @return @c 0 on success, @c -1 on failure.
- */
-static int refill_rx_buf(struct virtio_net_dev *dev, void *virt, uint64_t phys)
-{
-    memset(virt, 0, VIRTIO_NET_RX_BUF_SIZE);
-    if (virtqueue_add_buf(dev->rx_vq, phys, VIRTIO_NET_RX_BUF_SIZE,
-                          true, virt) < 0)
-    {
-        kprintf("[VIRTIO-NET] Failed to refill RX buffer\n");
-        dev->rx_dropped++;
-        return -1;
-    }
-    return 0;
-}
-
-/**
- * @brief Allocate and enqueue all RX buffers.
- *
- * Pre-fills the RX queue so the device has buffers to write received
- * packets into. Each buffer is one page (4 KiB).
- */
-static int virtio_net_setup_rx_buffers(struct virtio_net_dev *dev)
-{
-    for (int i = 0; i < VIRTIO_NET_RX_BUFFERS; ++i)
-    {
-        uint64_t phys = pmm_alloc_page();
-        if (phys == PMM_ALLOC_FAILED)
-        {
-            kprintf("[VIRTIO-NET] Failed to allocate RX buffer %d\n", i);
-            return -1;
-        }
-
-        void *virt = PHYS_TO_VIRT(phys);
-        memset(virt, 0, PAGE_SIZE);
-
-        dev->rx_bufs[i].virt = virt;
-        dev->rx_bufs[i].phys = phys;
-        dev->rx_buf_count    = i + 1;
-
-        if (virtqueue_add_buf(dev->rx_vq, phys, VIRTIO_NET_RX_BUF_SIZE,
-                              true, virt) < 0)
-        {
-            kprintf("[VIRTIO-NET] Failed to enqueue RX buffer %d\n", i);
-            return -1;
-        }
-    }
-
-    virtqueue_kick(dev->rx_vq);
-    kprintf("[VIRTIO-NET] Pre-filled %d RX buffers\n", VIRTIO_NET_RX_BUFFERS);
-    return 0;
-}
-
-/// Free the RX buffer pages (probe failure path; device is reset).
-static void free_rx_buffers(struct virtio_net_dev *dev)
-{
-    for (int i = 0; i < dev->rx_buf_count; ++i)
-        pmm_free_page(dev->rx_bufs[i].phys);
-    dev->rx_buf_count = 0;
-}
-
-// ── TX completion reclamation ──────────────────────────────────────────
-
-/**
- * @brief Free completed TX buffers.
- *
- * Called from @c virtio_net_poll() and before new sends to reclaim
- * pages used for transmitted packets.
- */
-static void reclaim_tx_buffers(struct virtio_net_dev *dev)
-{
-    void *buf;
-    while ((buf = virtqueue_get_buf(dev->tx_vq, NULL)) != NULL)
-        pmm_free_page(VIRT_TO_PHYS_ADDR((uintptr_t)buf));
-}
 
 // ── Interrupt handlers ─────────────────────────────────────────────────
 
@@ -222,32 +141,126 @@ static int setup_intx(struct virtio_net_dev *dev)
     return 0;
 }
 
-// ── netdev glue ────────────────────────────────────────────────────────
+// ── RX: zero-copy burst ────────────────────────────────────────────────
 
 /**
- * @brief @c netdev_ops.send: transmit @p nb on the device's TX queue.
+ * @brief Post free pool buffers on the RX queue, with one doorbell.
  *
- * @c virtio_net_send() copies the frame into its own DMA buffer, so the
- * @c netbuf is freed here. The driver always takes ownership of @p nb.
+ * Each buffer is posted so that the device writes the virtio header into
+ * the device headroom and the frame's first byte lands on @c nb->head.
+ * If the pool is empty, the ring just stays short until a later call.
+ *
+ * @return Number of buffers posted.
  */
-static int virtio_netdev_send(struct netdev *ndev, struct netbuf *nb)
+static uint16_t rx_refill(struct virtio_net_dev *dev)
 {
-    struct virtio_net_dev *dev = ndev->priv;
-    int ret = virtio_net_send(dev, nb->data, nb->len);
-    netbuf_free(nb);
-    return ret;
+    uint16_t posted = 0;
+
+    while (dev->rx_vq->num_free > 0)
+    {
+        struct netbuf *nb = netbuf_pool_alloc(dev->rx_pool);
+        if (!nb)
+            break;
+
+        uint32_t room = (uint32_t)(nb->end - nb->head);
+        virtqueue_add_buf(dev->rx_vq, nb->phys_addr - VIRTIO_NET_HDR_SIZE,
+                          VIRTIO_NET_HDR_SIZE + room, true, nb);
+        posted++;
+    }
+
+    if (posted)
+        virtqueue_kick(dev->rx_vq);
+    return posted;
 }
 
-/// @c netdev_ops.poll: deliver completed RX frames to the stack.
-static void virtio_netdev_poll(struct netdev *ndev)
+/// @c netdev_ops.rx_burst: hand out completed RX buffers, then refill.
+static uint16_t virtio_netdev_rx_burst(struct netdev *ndev, uint16_t qid,
+                                       struct netbuf **pkts, uint16_t max)
 {
-    virtio_net_poll(ndev->priv);
+    (void)qid;  // single queue for now
+    struct virtio_net_dev *dev = ndev->priv;
+    uint16_t n = 0;
+
+    while (n < max)
+    {
+        uint32_t len;
+        struct netbuf *nb = virtqueue_get_buf(dev->rx_vq, &len);
+        if (!nb)
+            break;
+
+        if (len <= VIRTIO_NET_HDR_SIZE
+            || !netbuf_put_quiet(nb, len - VIRTIO_NET_HDR_SIZE))
+        {
+            dev->rx_dropped++;
+            netbuf_free(nb);
+            continue;
+        }
+        pkts[n++] = nb;
+    }
+
+    rx_refill(dev);
+    return n;
 }
+
+/// @c netdev_ops.rx_irq: the RX queue's interrupt on or off.
+static void virtio_netdev_rx_irq(struct netdev *ndev, uint16_t qid, bool enable)
+{
+    (void)qid;
+    struct virtio_net_dev *dev = ndev->priv;
+
+    if (enable)
+        virtqueue_enable_interrupts(dev->rx_vq);
+    else
+        virtqueue_disable_interrupts(dev->rx_vq);
+}
+
+// ── TX: zero-copy burst ────────────────────────────────────────────────
+
+/// Free every netbuf the device has finished sending.
+static void tx_reclaim(struct virtio_net_dev *dev)
+{
+    struct netbuf *nb;
+    while ((nb = virtqueue_get_buf(dev->tx_vq, NULL)) != NULL)
+        netbuf_free(nb);
+}
+
+/**
+ * @brief @c netdev_ops.tx_burst: post netbufs directly, one doorbell.
+ *
+ * The zeroed virtio header goes into the space below @c nb->data, which
+ * the device headroom guarantees for every netbuf.
+ */
+static uint16_t virtio_netdev_tx_burst(struct netdev *ndev, uint16_t qid,
+                                       struct netbuf **pkts, uint16_t n)
+{
+    (void)qid;  // single queue for now
+    struct virtio_net_dev *dev = ndev->priv;
+
+    tx_reclaim(dev);
+
+    uint16_t sent = 0;
+    while (sent < n && dev->tx_vq->num_free > 0)
+    {
+        struct netbuf *nb = pkts[sent];
+
+        memset(nb->data - VIRTIO_NET_HDR_SIZE, 0, VIRTIO_NET_HDR_SIZE);
+        virtqueue_add_buf(dev->tx_vq, netbuf_data_phys(nb) - VIRTIO_NET_HDR_SIZE,
+                          VIRTIO_NET_HDR_SIZE + nb->len, false, nb);
+        sent++;
+    }
+
+    if (sent)
+        virtqueue_kick(dev->tx_vq);
+    return sent;
+}
+
+// ── netdev glue ────────────────────────────────────────────────────────
 
 static const struct netdev_ops virtio_netdev_ops =
 {
-    .send = virtio_netdev_send,
-    .poll = virtio_netdev_poll,
+    .rx_burst = virtio_netdev_rx_burst,
+    .tx_burst = virtio_netdev_tx_burst,
+    .rx_irq   = virtio_netdev_rx_irq,
 };
 
 /// Create, register, and bring up the netdev for @p dev.
@@ -348,8 +361,17 @@ static int virtio_net_probe(struct pci_device *pci)
         goto fail;
     }
 
-    if (virtio_net_setup_rx_buffers(dev) < 0)
+    // Polled by default
+    virtqueue_disable_interrupts(dev->rx_vq);
+    virtqueue_disable_interrupts(dev->tx_vq);
+
+    // The device can start receiving as soon as it goes live
+    dev->rx_pool = netbuf_pool_create(smp_core_id());
+    if (!dev->rx_pool)
         goto fail;
+    uint16_t posted = rx_refill(dev);
+    kprintf("[VIRTIO-NET] Pool of %u buffers, %u posted\n",
+            dev->rx_pool->capacity, posted);
 
     // Mark the device as live
     virtio_set_status(vdev, VIRTIO_STATUS_DRIVER_OK);
@@ -379,7 +401,7 @@ fail:
     instances[instance_count] = NULL;
     if (dev->intx_line < 0)
         pci_msix_free(pci);  // INTx vectors stay with their line
-    free_rx_buffers(dev);
+    netbuf_pool_destroy(dev->rx_pool);
     if (dev->tx_vq)
         virtqueue_destroy(dev->tx_vq);
     if (dev->rx_vq)
@@ -420,160 +442,6 @@ struct virtio_net_dev *virtio_net_get(int index)
     if (index < 0 || index >= instance_count)
         return NULL;
     return instances[index];
-}
-
-// ── Transmit ───────────────────────────────────────────────────────────
-
-int virtio_net_send(struct virtio_net_dev *dev, const void *data, size_t len)
-{
-    if (!dev || !data || len == 0)
-        return -1;
-
-    // Reclaim any completed TX buffers first
-    reclaim_tx_buffers(dev);
-
-    if (dev->tx_vq->num_free < 1)
-    {
-        dev->tx_dropped++;
-        return -1;
-    }
-
-    // Allocate a page for the TX buffer (header + packet)
-    size_t total_len = VIRTIO_NET_HDR_SIZE + len;
-    uint64_t phys = pmm_alloc_page();
-    if (phys == PMM_ALLOC_FAILED)
-    {
-        dev->tx_dropped++;
-        return -1;
-    }
-
-    void *virt = PHYS_TO_VIRT(phys);
-
-    // Build the packet: zeroed virtio header + payload
-    struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)virt;
-    memset(hdr, 0, VIRTIO_NET_HDR_SIZE);
-    memcpy((uint8_t *)virt + VIRTIO_NET_HDR_SIZE, data, len);
-
-    // Submit to the TX queue
-    if (virtqueue_add_buf(dev->tx_vq, phys, total_len, false, virt) < 0)
-    {
-        pmm_free_page(phys);
-        dev->tx_dropped++;
-        return -1;
-    }
-
-    virtqueue_kick(dev->tx_vq);
-
-    dev->tx_packets++;
-    dev->tx_bytes += len;
-
-    return 0;
-}
-
-// ── Receive (polling, single packet) ───────────────────────────────────
-
-int virtio_net_receive(struct virtio_net_dev *dev, void *buf, size_t buflen)
-{
-    if (!dev || !buf)
-        return -1;
-
-    uint32_t len;
-    void *rx_buf = virtqueue_get_buf(dev->rx_vq, &len);
-    if (!rx_buf)
-        return 0;  // no packet available
-
-    // Skip the virtio-net header
-    if (len <= VIRTIO_NET_HDR_SIZE)
-    {
-        // Runt packet - refill and drop
-        dev->rx_dropped++;
-        refill_rx_buf(dev, rx_buf, VIRT_TO_PHYS_ADDR((uintptr_t)rx_buf));
-        virtqueue_kick(dev->rx_vq);
-        return 0;
-    }
-
-    const uint8_t *pkt_data = (const uint8_t *)rx_buf + VIRTIO_NET_HDR_SIZE;
-    size_t pkt_len = len - VIRTIO_NET_HDR_SIZE;
-
-    // Copy to the caller's buffer (truncate if necessary)
-    size_t copy_len = (pkt_len > buflen) ? buflen : pkt_len;
-    memcpy(buf, pkt_data, copy_len);
-
-    dev->rx_packets++;
-    dev->rx_bytes += pkt_len;
-
-    // Refill the RX slot
-    refill_rx_buf(dev, rx_buf, VIRT_TO_PHYS_ADDR((uintptr_t)rx_buf));
-    virtqueue_kick(dev->rx_vq);
-
-    return (int)copy_len;
-}
-
-// ── Poll (process all pending RX and TX completions) ───────────────────
-
-/**
- * @brief Copy one received frame into a @c netbuf and queue it on the
- *        device's netdev (TODO: will soon be replaced with zero-copy RX).
- */
-static void deliver_rx(struct virtio_net_dev *dev, const void *data,
-                       size_t len)
-{
-    if (!dev->netdev)
-        return;
-
-    struct netbuf *nb = netbuf_alloc(0);
-    if (!nb)
-    {
-        dev->rx_dropped++;
-        return;
-    }
-
-    void *p = netbuf_put(nb, len);
-    if (!p)
-    {
-        netbuf_free(nb);
-        dev->rx_dropped++;
-        return;
-    }
-    memcpy(p, data, len);
-
-    netdev_receive(dev->netdev, nb);
-}
-
-void virtio_net_poll(struct virtio_net_dev *dev)
-{
-    if (!dev)
-        return;
-
-    // Reclaim completed TX buffers
-    reclaim_tx_buffers(dev);
-
-    // Process all completed RX buffers
-    uint32_t len;
-    void    *rx_buf;
-    bool     refilled = false;
-
-    while ((rx_buf = virtqueue_get_buf(dev->rx_vq, &len)) != NULL)
-    {
-        if (len <= VIRTIO_NET_HDR_SIZE)
-            dev->rx_dropped++;
-        else
-        {
-            size_t pkt_len = len - VIRTIO_NET_HDR_SIZE;
-            dev->rx_packets++;
-            dev->rx_bytes += pkt_len;
-            deliver_rx(dev, (const uint8_t *)rx_buf + VIRTIO_NET_HDR_SIZE,
-                       pkt_len);
-        }
-
-        // Refill this RX slot for the device to reuse
-        refill_rx_buf(dev, rx_buf, VIRT_TO_PHYS_ADDR((uintptr_t)rx_buf));
-        refilled = true;
-    }
-
-    // Kick only if buffers were refilled
-    if (refilled)
-        virtqueue_kick(dev->rx_vq);
 }
 
 // ── Status and configuration ───────────────────────────────────────────

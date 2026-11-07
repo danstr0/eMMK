@@ -10,6 +10,8 @@
 
 #include "test.h"
 #include "netbuf.h"
+#include "pmm.h"
+#include "smp.h"
 
 uint32_t test_netbuf(void)
 {
@@ -235,6 +237,130 @@ uint32_t test_netbuf(void)
 
         netbuf_free(a);
         netbuf_free(b);
+    }
+
+    // ── Layout: one allocation, device headroom below head
+    {
+        struct netbuf *nb = netbuf_alloc(0);
+        TEST_ASSERT_EQ((uintptr_t)nb->head,
+                       (uintptr_t)nb + NETBUF_DATA_OFFSET,
+                       "metadata embedded in front of the data");
+        TEST_ASSERT_EQ((size_t)(nb->end - nb->head), NETBUF_DATA_SIZE,
+                       "default data size");
+        TEST_ASSERT_EQ(nb->phys_addr,
+                       VIRT_TO_PHYS_ADDR((uintptr_t)nb) + NETBUF_DATA_OFFSET,
+                       "phys_addr is that of head");
+    
+        netbuf_reserve(nb, 34);
+        TEST_ASSERT_EQ(netbuf_data_phys(nb), nb->phys_addr + 34,
+                       "netbuf_data_phys follows data");
+        netbuf_free(nb);
+    }
+
+    // ── Oversized buffers come from the PMM ─────────────
+    {
+        struct pmm_stats before, after;
+        pmm_get_stats(&before);
+
+        struct netbuf *nb = netbuf_alloc(8192);
+        TEST_ASSERT(nb != NULL, "oversized alloc");
+        if (nb)
+        {
+            TEST_ASSERT_EQ((size_t)(nb->end - nb->head), 8192,
+                           "oversized size");
+            memset(netbuf_put(nb, 8192), 0x5A, 8192);
+            netbuf_free(nb);
+        }
+
+        pmm_get_stats(&after);
+        TEST_ASSERT_EQ(after.free_pages, before.free_pages,
+                       "oversized free returns its pages");
+    }
+
+    // ── Pools ───────────────────────────────────────────
+    {
+        struct pmm_stats before, after;
+        pmm_get_stats(&before);
+
+        int me = smp_core_id();
+        struct netbuf_pool *pool = netbuf_pool_create(me);
+        TEST_ASSERT(pool != NULL, "pool created");
+    
+        if (pool)
+        {
+            TEST_ASSERT_EQ(pool->phys & (NETBUF_POOL_BLOCK_SIZE - 1), 0,
+                           "pool block is 2 MiB aligned");
+            TEST_ASSERT(pool->capacity >= 1000, "pool holds ~1000 buffers");
+            TEST_ASSERT_EQ(netbuf_pool_available(pool), pool->capacity,
+                           "all buffers free at first");
+        
+            // Allocation does not touch the allocators
+            uint64_t slow = netbuf_slow_allocs();
+            struct netbuf *a = netbuf_pool_alloc(pool);
+            TEST_ASSERT(a != NULL, "pool alloc");
+            TEST_ASSERT_EQ(netbuf_slow_allocs(), slow, "pool alloc is not slow");
+            TEST_ASSERT_EQ(a->refcount, 1, "pool buffer: refcount 1");
+            TEST_ASSERT(a->pool == pool, "pool buffer knows its pool");
+            TEST_ASSERT_EQ(a->phys_addr,
+                           VIRT_TO_PHYS_ADDR((uintptr_t)a) + NETBUF_DATA_OFFSET,
+                           "pool buffer phys_addr");
+            TEST_ASSERT_EQ((uintptr_t)a->data, (uintptr_t)a->head,
+                           "pool buffer starts empty");
+        
+            // Metadata is reset on reuse; LIFO hands back the same buffer
+            netbuf_reserve(a, 20);
+            netbuf_put(a, 100);
+            a->src_ip = 0x01020304;
+            netbuf_free(a);
+            struct netbuf *b = netbuf_pool_alloc(pool);
+            TEST_ASSERT_EQ((uintptr_t)b, (uintptr_t)a, "LIFO: hot buffer reused");
+            TEST_ASSERT(b->len == 0 && b->src_ip == 0 && b->data == b->head,
+                        "metadata reset on reuse");
+
+            // Double free is caught, not stacked twice
+            netbuf_free(b);
+            uint32_t avail = netbuf_pool_available(pool);
+            netbuf_free(b);
+            TEST_ASSERT_EQ(netbuf_pool_available(pool), avail,
+                           "double free ignored");
+        
+            // Exhaustion fails cleanly and recovers
+            static struct netbuf *all[NETBUF_POOL_MAX];
+            uint32_t n = 0;
+            while ((all[n] = netbuf_pool_alloc(pool)) != NULL)
+                n++;
+            TEST_ASSERT_EQ(n, pool->capacity, "every buffer allocatable");
+            TEST_ASSERT(pool->alloc_fails == 1, "empty pool reports failure");
+
+            bool unique = true;
+            for (uint32_t i = 1; i < n; ++i)
+                if ((uintptr_t)all[i] - (uintptr_t)all[i - 1] != NETBUF_SIZE)
+                    unique = false;
+            TEST_ASSERT(unique, "buffers are distinct and contiguous");
+
+            // A free on another core goes through the remote list
+            pool->owner_core = me + 1;
+            netbuf_free(all[0]);
+            netbuf_free(all[1]);
+            pool->owner_core = me;
+            TEST_ASSERT_EQ(pool->remote_frees, 2, "remote frees counted");
+            TEST_ASSERT_EQ(pool->free_count, 0, "not on the owner's stack yet");
+
+            struct netbuf *c = netbuf_pool_alloc(pool);
+            TEST_ASSERT(c == all[0] || c == all[1],
+                        "owner reclaims remote frees when empty");
+            netbuf_free(c);
+            for (uint32_t i = 2; i < n; ++i)
+                netbuf_free(all[i]);
+            TEST_ASSERT_EQ(netbuf_pool_available(pool), pool->capacity,
+                           "all buffers back");
+
+            netbuf_pool_destroy(pool);
+        }
+
+        pmm_get_stats(&after);
+        TEST_ASSERT_EQ(after.free_pages, before.free_pages,
+                       "pool destroy returns the block");
     }
 
     // ── Overflow / underflow guards ─────────────────────

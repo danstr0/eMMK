@@ -34,7 +34,7 @@ struct netdev *netdev_alloc(const char *name)
         strlcpy(dev->name, name, sizeof(dev->name));
 
     dev->mtu = ETH_MTU;
-    netbuf_queue_init(&dev->rx_queue);
+    dev->num_queues = 1;
 
     return dev;
 }
@@ -65,8 +65,6 @@ int netdev_register(struct netdev *dev)
         return -1;
     }
 
-    netbuf_queue_init(&dev->rx_queue);
-
     if (dev->mtu == 0)
         dev->mtu = ETH_MTU;
 
@@ -86,8 +84,9 @@ void netdev_unregister(struct netdev *dev)
     for (int i = 0; i < device_count; ++i)
         if (devices[i] == dev)
         {
-            // Purge any queued RX packets
-            netbuf_queue_purge(&dev->rx_queue);
+            // Drop anything still held back for transmission
+            while (dev->tx_held > 0)
+                netbuf_free(dev->tx_hold[--dev->tx_held]);
 
             // Compact the device table
             for (int j = i; j < device_count - 1; ++j)
@@ -131,82 +130,151 @@ struct netdev *netdev_get(int index)
 
 // ── Data path - transmit ───────────────────────────────────────────────
 
+/// Inside a netdev_tx_defer_begin() section (written by the TX owner only).
+static bool tx_deferred = false;
+
+uint16_t netdev_tx_burst(struct netdev *dev, uint16_t qid,
+                         struct netbuf **pkts, uint16_t n)
+{
+    if (!dev->ops || !dev->ops->tx_burst)
+        return 0;
+
+    if (n > NETDEV_BURST_MAX)
+        n = NETDEV_BURST_MAX;
+
+    // Read the lengths first
+    uint32_t lens[NETDEV_BURST_MAX];
+    for (uint16_t i = 0; i < n; ++i)
+        lens[i] = pkts[i]->len;
+
+    uint16_t sent = dev->ops->tx_burst(dev, qid, pkts, n);
+
+    dev->stats.tx_packets += sent;
+    for (uint16_t i = 0; i < sent; ++i)
+        dev->stats.tx_bytes += lens[i];
+
+    return sent;
+}
+
+/// Post everything held back on @p dev; drop what the driver refuses.
+static void tx_flush(struct netdev *dev)
+{
+    uint16_t held = dev->tx_held;
+    uint16_t sent = netdev_tx_burst(dev, 0, dev->tx_hold, held);
+
+    for (uint16_t i = sent; i < held; ++i)
+    {
+        dev->stats.tx_dropped++;
+        netbuf_free(dev->tx_hold[i]);
+    }
+    dev->tx_held = 0;
+}
+
 int netdev_send(struct netdev *dev, struct netbuf *nb)
 {
     if (!dev || !nb)
         return -1;
 
-    if (!netdev_is_up(dev))
+    if (!netdev_is_up(dev) || !dev->ops || !dev->ops->tx_burst )
     {
         dev->stats.tx_dropped++;
         netbuf_free(nb);
         return -1;
     }
 
-    if (!dev->ops || !dev->ops->send)
+    if (tx_deferred)
     {
-        dev->stats.tx_dropped++;
-        netbuf_free(nb);
-        return -1;
+        if (dev->tx_held == NETDEV_BURST_MAX)
+            tx_flush(dev);
+        dev->tx_hold[dev->tx_held++] = nb;
+        return 0;
     }
 
-    // Save the length before calling send — the driver takes ownership
-    // of nb and may free it before returning
-    uint32_t pkt_len = nb->len;
+    if (netdev_tx_burst(dev, 0, &nb, 1) == 1)
+        return 0;
 
-    int ret = dev->ops->send(dev, nb);
+    dev->stats.tx_dropped++;
+    netbuf_free(nb);
+    return -1;
+}
 
-    if (ret == 0)
-    {
-        dev->stats.tx_packets++;
-        dev->stats.tx_bytes += pkt_len;
-    }
-    else
-        dev->stats.tx_errors++;
+void netdev_tx_defer_begin(void)
+{
+    tx_deferred = true;
+}
 
-    return ret;
+void netdev_tx_defer_end(void)
+{
+    tx_deferred = false;
+
+    for (int i = 0; i < device_count; ++i)
+        if (devices[i]->tx_held > 0)
+            tx_flush(devices[i]);
 }
 
 // ── Data path - receive ────────────────────────────────────────────────
 
-void netdev_receive(struct netdev *dev, struct netbuf *nb)
+uint16_t netdev_rx_burst(struct netdev *dev, uint16_t qid,
+                         struct netbuf **pkts, uint16_t max)
 {
-    if (!dev || !nb)
-        return;
+    if (!netdev_is_up(dev) || !dev->ops || !dev->ops->rx_burst)
+        return 0;
 
-    nb->dev = dev;
-    dev->stats.rx_packets++;
-    dev->stats.rx_bytes += nb->len;
+    uint16_t n = dev->ops->rx_burst(dev, qid, pkts, max);
 
-    netbuf_queue_push(&dev->rx_queue, nb);
+    for (uint16_t i = 0; i < n; ++i)
+    {
+        pkts[i]->dev = dev;
+        dev->stats.rx_bytes += pkts[i]->len;
+    }
+    dev->stats.rx_packets += n;
+
+    return n;
 }
 
 // ── Polling ────────────────────────────────────────────────────────────
 
-void netdev_poll(struct netdev *dev)
+uint16_t netdev_poll(struct netdev *dev)
 {
-    if (!dev || !netdev_is_up(dev))
-        return;
-    if (dev->ops && dev->ops->poll)
-        dev->ops->poll(dev);
+    struct netbuf *pkts[NETDEV_BURST_MAX];
+    uint16_t n = netdev_rx_burst(dev, 0, pkts, NETDEV_BURST_MAX);
+
+    for (uint16_t i = 0; i < n; ++i)
+        eth_input(pkts[i]);
+
+    return n;
 }
 
-void netdev_poll_all(void)
+uint32_t netdev_poll_all(void)
 {
+    uint32_t total = 0;
+
+    netdev_tx_defer_begin();
     for (int i = 0; i < device_count; ++i)
-        netdev_poll(devices[i]);
+        total += netdev_poll(devices[i]);
+    netdev_tx_defer_end();
+
+    return total;
 }
 
-void netdev_process_rx(void)
+// ── Idle ───────────────────────────────────────────────────────────────
+
+void netdev_rx_irq_all(bool enable)
 {
     for (int i = 0; i < device_count; ++i)
-    {
-        struct netdev *dev = devices[i];
-        struct netbuf *nb;
+        if (devices[i]->ops && devices[i]->ops->rx_irq)
+            devices[i]->ops->rx_irq(devices[i], 0, enable);
+}
 
-        while ((nb = netbuf_queue_pop(&dev->rx_queue)) != NULL)
-            eth_input(nb);
-    }
+void netdev_idle_wait(void)
+{
+    netdev_rx_irq_all(true);
+
+    // A packet that arrived before the interrupt was enabled raises none
+    if (netdev_poll_all() == 0)
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+
+    netdev_rx_irq_all(false);
 }
 
 // ── IP configuration ───────────────────────────────────────────────────

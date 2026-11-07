@@ -185,6 +185,21 @@ int udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
  */
 int udp_output(struct netbuf *nb, uint32_t dst_ip,
                uint16_t dst_port, uint16_t src_port);
+
+/**
+ * @brief Answer a received datagram in place (zero-copy, no allocation).
+ *
+ * For use in a receive handler: the received buffer itself becomes the
+ * reply. Its payload (as the handler left it) is sent back to the sender,
+ * with the headers rewritten in the same bytes.
+ *
+ * @param nb  The netbuf a @c udp_recv_func_t received, @c data still at
+ *            the payload.
+ * @return @c 0 on success (or queued), @c -1 on error.
+ *
+ * @note Always consumes @p nb.
+ */
+int udp_reply(struct netbuf *nb);
 /// @}
 
 #endif // EMMK_UDP_H

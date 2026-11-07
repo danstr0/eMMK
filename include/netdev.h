@@ -9,16 +9,25 @@
  * Each network device has:
  * - Identity: name, MAC address.
  * - IP configuration: address, netmask, gateway (IPv4 only).
- * - Operations: open, close, send, poll (provided by the driver).
+ * - Operations: open, close, per-queue RX / TX bursts (provided by the
+ *   driver).
+ * - Hardware queues: @c num_queues RX/TX pairs, each used by one core.
  * - Statistics: packet / byte counters.
- * - RX queue: incoming packets queued for stack processing.
  *
  * @par Lifecycle
  * 1. Driver allocates a netdev (@c netdev_alloc).
  * 2. Driver fills in name, MAC, ops, priv.
  * 3. Driver calls @c netdev_register().
  * 4. Network stack calls @c netdev_set_ip() to configure addressing.
- * 5. Main loop calls @c netdev_poll_all() + @c netdev_process_rx().
+ * 5. Main loop calls @c netdev_poll_all(), which receives a burst from
+ *    every device and runs each packet through the stack.
+ *
+ * @par Bursts
+ * @c netdev_rx_burst() returns netbufs whose data @c is the DMA buffer;
+ * @c netdev_tx_burst() posts netbufs directly. Each rings at most one
+ * doorbell. A stack reply built while a burst is being processed is held
+ * back (see @c netdev_tx_defer_begin()) so that the whole burst of
+ * replies also shares one doorbell.
  */
 
 #ifndef EMMK_NETDEV_H
@@ -39,6 +48,9 @@
 
 /// Maximum number of registered network devices.
 #define NETDEV_MAX  16
+
+/// Largest burst handled at once (and TX packets held back per device).
+#define NETDEV_BURST_MAX  32
 /// @}
 
 /// @name Device flags
@@ -85,11 +97,31 @@ struct netdev_ops
     /// Bring the device down (disable RX / TX).
     int  (*close)(struct netdev *dev);
 
-    /// Transmit a packet. The driver takes ownership of @p nb.
-    int  (*send)(struct netdev *dev, struct netbuf *nb);
+    /**
+     * Receive up to @p max packets from queue @p qid. Each returned
+     * netbuf holds one Ethernet frame (@c data at its first byte) and
+     * belongs to the caller. Refills the ring; at most one doorbell.
+     * @return Number of packets stored in @p pkts.
+     */
+    uint16_t (*rx_burst)(struct netdev *dev, uint16_t qid,
+                         struct netbuf **pkts, uint16_t max);
 
-    /// Poll for received packets (called from the main loop).
-    void (*poll)(struct netdev *dev);
+    /**
+     * Post the first packets of @p pkts on queue @p qid; at most one
+     * doorbell. The driver takes ownership of those it accepts, and frees
+     * them on completion; it must not touch the rest. Also reclaims
+     * completed packets, so `n == 0` is a pure reclaim.
+     * @return Number of packets accepted.
+     */
+    uint16_t (*tx_burst)(struct netdev *dev, uint16_t qid,
+                         struct netbuf **pkts, uint16_t n);
+
+    /**
+     * Allow (@p enable) or suppress the interrupt of RX queue @p qid.
+     * Suppressed is the default: polling cores never take it. After
+     * enabling, the caller must poll once more before halting.
+     */
+    void (*rx_irq)(struct netdev *dev, uint16_t qid, bool enable);
 
     /// Set the device's MAC address.
     int  (*set_mac)(struct netdev *dev, const uint8_t *mac);
@@ -117,10 +149,14 @@ struct netdev
     /// @{
     const struct netdev_ops *ops;  ///< Device operations.
     void *priv;                    ///< Driver-private data.
+    uint16_t num_queues;           ///< Hardware RX/TX queue pairs.
     /// @}
 
-    /// Receive queue (packets waiting for stack processing).
-    struct netbuf_queue rx_queue;
+    /// @name Held-back transmissions (see @c netdev_tx_defer_begin())
+    /// @{
+    uint16_t tx_held;                          ///< Packets in @c tx_hold.
+    struct netbuf *tx_hold[NETDEV_BURST_MAX];  ///< Packets not yet posted.
+    /// @}
 };
 
 /// @name Initialization
@@ -181,10 +217,40 @@ struct netdev *netdev_get(int index);
 /// @{
 
 /**
- * @brief Transmit a packet through a device.
+ * @brief Receive a burst of packets from one queue.
  *
- * Calls @c dev->ops->send(). Always consumes @p nb regardless of
- * success or failure (freed on error, owned by the driver on success).
+ * Sets @c nb->dev and updates the RX counters.
+ *
+ * @param dev   Network device.
+ * @param qid   Queue index (below @c dev->num_queues).
+ * @param pkts  Output array.
+ * @param max   Capacity of @p pkts.
+ * @return Number of packets received (each now owned by the caller).
+ */
+uint16_t netdev_rx_burst(struct netdev *dev, uint16_t qid,
+                         struct netbuf **pkts, uint16_t max);
+
+/**
+ * @brief Transmit a burst of packets on one queue, with one doorbell.
+ *
+ * @param dev   Network device.
+ * @param qid   Queue index (below @c dev->num_queues).
+ * @param pkts  Packets to send.
+ * @param n     Number of packets (@c 0 = only reclaim completed packets).
+ * @return Number of packets accepted (now owned by the driver). The
+ *         remaining ones still belong to the caller.
+ */
+uint16_t netdev_tx_burst(struct netdev *dev, uint16_t qid,
+                         struct netbuf **pkts, uint16_t n);
+
+/**
+ * @brief Transmit a packet through a device (stack entry point).
+ *
+ * Always consumes @p nb regardless of success or failure (freed on
+ * error, owned by the driver on success). Inside a
+ * @c netdev_tx_defer_begin() section the packet is held back and posted
+ * with the rest of the burst; a later failure is then counted in
+ * @c tx_dropped, and @c 0 has been returned.
  *
  * @param dev  Network device.
  * @param nb   Network buffer.
@@ -193,31 +259,46 @@ struct netdev *netdev_get(int index);
 int netdev_send(struct netdev *dev, struct netbuf *nb);
 
 /**
- * @brief Queue a received packet for stack processing.
+ * @brief Start holding back @c netdev_send() on every device.
  *
- * Called by the device driver (from poll or IRQ handler) to hand a
- * received packet to the network stack. The packet is queued and
- * processed during @c netdev_process_rx().
- *
- * @param dev  Network device that received the packet.
- * @param nb   Network buffer containing the raw frame.
+ * Lets a burst of replies share one doorbell per device. Only the TX
+ * owner may use it. @c netdev_tx_defer_end() posts what is held.
  */
-void netdev_receive(struct netdev *dev, struct netbuf *nb);
+void netdev_tx_defer_begin(void);
 
-/// Poll a single device for received packets.
-void netdev_poll(struct netdev *dev);
-
-/// Poll all registered devices.
-void netdev_poll_all(void);
+/// Stop holding back, and post everything held on every device.
+void netdev_tx_defer_end(void);
 
 /**
- * @brief Process all queued received packets.
- *
- * Dequeues packets from each device's RX queue and passes them to
- * @c eth_input() for L2 processing. Called from the main
- * run-to-completion loop.
+ * @brief Receive one burst from queue 0 and run it through the stack.
+ * @return Number of packets processed.
  */
-void netdev_process_rx(void);
+uint16_t netdev_poll(struct netdev *dev);
+
+/**
+ * @brief Poll every device, with replies batched per device.
+ * @return Number of packets processed.
+ */
+uint32_t netdev_poll_all(void);
+
+/**
+ * @brief Allow or suppress RX interrupts on every device.
+ *
+ * Interrupts are suppressed by default: a core that polls continuously
+ * is never disturbed. See @c netdev_idle_wait().
+ */
+void netdev_rx_irq_all(bool enable);
+
+/**
+ * @brief Sleep until a device interrupt, without losing a wake-up.
+ *
+ * Enables RX interrupts, polls once more (a packet that arrived before
+ * they were enabled raises no interrupt), and halts only if that found
+ * nothing. Interrupts are suppressed again on return.
+ *
+ * @pre Interrupts disabled on this core (they stay disabled on return).
+ */
+void netdev_idle_wait(void);
 /// @}
 
 /// @name Configuration

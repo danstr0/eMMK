@@ -112,15 +112,11 @@ static void net_configure(void)
 /// UDP echo handler — reflects datagrams back to the sender.
 static void udp_echo_handler(struct netbuf *nb)
 {
-    uint32_t src = nb->src_ip;
-    uint16_t sport = nb->src_port;
-    uint16_t dport = nb->dst_port;
-
-    // Send the echo reply, copying the payload
+    // Echo in place: this buffer, rewritten, is the reply
     if (nb->len > 0 && nb->len <= 1400)
-        udp_send(src, sport, dport, nb->data, nb->len);
-
-    netbuf_free(nb);
+        udp_reply(nb);
+    else
+        netbuf_free(nb);
 }
 
 ///  Wraps @c dispatch_worker_loop with per-packet TSC measurement.
@@ -151,6 +147,25 @@ static NORETURN void bench_worker_loop(int core_index)
     }
 }
 
+/// Report the buffer counters: with zero-copy echo, packets flow through
+/// the pools while slow_allocs stays flat.
+static void demo_report_buffers(void)
+{
+    uint64_t pool_allocs = 0, remote_frees = 0, fails = 0;
+
+    for (int i = 0; i < virtio_net_count(); ++i)
+    {
+        struct netbuf_pool *pool = virtio_net_get(i)->rx_pool;
+        pool_allocs  += pool->allocs;
+        remote_frees += pool->remote_frees;
+        fails        += pool->alloc_fails;
+    }
+
+    kprintf("[NETBUF] slow_allocs=%lu pool_allocs=%lu remote_frees=%lu "
+            "pool_empty=%lu\n", netbuf_slow_allocs(), pool_allocs,
+            remote_frees, fails);
+}
+
 /// Distributor loop with periodic benchmark reporting.
 static NORETURN void bench_distributor_loop(int core_index)
 {
@@ -162,7 +177,6 @@ static NORETURN void bench_distributor_loop(int core_index)
 
     for (;;)
     {
-        netdev_poll_all();
         dispatch_rx();
 
         // Report every ~5 seconds
@@ -170,6 +184,7 @@ static NORETURN void bench_distributor_loop(int core_index)
         if (now >= next_report)
         {
             bench_report();
+            demo_report_buffers();
             next_report = now + tsc_get_freq() * 5;
         }
 
@@ -384,7 +399,6 @@ non_demo:
         for (int i = 0; i < 500; ++i)
         {
             netdev_poll_all();
-            netdev_process_rx();
             timer_sleep_ms(1);
         }
     }
@@ -394,9 +408,9 @@ non_demo:
     __asm__ volatile("cli");
     for (;;)
     {
-        netdev_poll_all();
-        netdev_process_rx();
-        __asm__ volatile("sti; hlt; cli" ::: "memory");
+        while (netdev_poll_all() > 0)
+            ;
+        netdev_idle_wait();
     }
 }
 

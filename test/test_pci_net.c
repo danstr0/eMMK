@@ -17,6 +17,8 @@
 #include "virtio.h"
 #include "virtio_net.h"
 #include "netdev.h"
+#include "netbuf.h"
+#include "ethernet.h"
 #include "io.h"
 #include "icmp.h"
 #include "timer.h"
@@ -69,6 +71,14 @@ static const struct pci_driver drv_no_probe =
 static bool is_pow2(uint64_t x)
 {
     return x != 0 && (x & (x - 1)) == 0;
+}
+
+/// Send one echo request to each NIC's gateway.
+static void send_pings(int nics, uint16_t seq)
+{
+    for (int i = 0; i < nics; ++i)
+        icmp_send_echo_request(IP4_ADDR(10, 0, 2 + i, 2),
+                               0x5b, seq, "5b", 2);
 }
 
 uint32_t test_pci_net(void)
@@ -197,7 +207,8 @@ uint32_t test_pci_net(void)
                 vecreg_ok = false;
         }
 
-        if (dev->rx_packets != 0 || dev->tx_packets != 0)
+        if (dev->netdev->stats.rx_packets != 0
+            || dev->netdev->stats.tx_packets != 0)
             stats_ok = false;
     }
     TEST_ASSERT(bound_ok, "each device bound");
@@ -396,19 +407,59 @@ uint32_t test_pci_net(void)
         }
 
         struct icmp_stats s0, s1;
-        icmp_get_stats(&s0);
-
         __asm__ volatile("sti");
-        for (int i = 0; i < n; ++i)
-            icmp_send_echo_request(IP4_ADDR(10, 0, 2 + i, 2), 0x5b,
-                                   (uint16_t)(i + 1), "5b", 2);
-    
+
+        icmp_get_stats(&s0);
+        send_pings(n, 1);
+
+        bool zero_copy = true;
         uint64_t deadline = timer_deadline_ms(3000);
+        do
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                struct virtio_net_dev *dev = virtio_net_get(i);
+                struct netbuf *pkts[NETDEV_BURST_MAX];
+                uint16_t got = netdev_rx_burst(dev->netdev, 0, pkts,
+                                               NETDEV_BURST_MAX);
+                for (uint16_t j = 0; j < got; ++j)
+                {
+                    if (pkts[j]->pool != dev->rx_pool
+                     || pkts[j]->dev != dev->netdev
+                     || pkts[j]->data != pkts[j]->head)
+                     zero_copy = false;
+                    eth_input(pkts[j]);
+                }
+            }
+            icmp_get_stats(&s1);
+        } while (s1.rx_echo_reply - s0.rx_echo_reply < (uint64_t)n
+                 && !timer_deadline_expired(deadline));
+
+        TEST_ASSERT_EQ(s1.rx_echo_reply - s0.rx_echo_reply, (uint64_t)n,
+                       "every NIC's gateway answers ping");
+        TEST_ASSERT(zero_copy, "received netbufs are the pool's DMA buffers");
+
+        bool rx_ok = true, quiet = true;
+        for (int i = 0; i < n; ++i)
+        {
+            if (virtio_net_get(i)->netdev->stats.rx_packets == 0)
+                rx_ok = false;
+            if (virtio_net_get(i)->irq_count != irq_before[i])
+                quiet = false;
+        }
+        TEST_ASSERT(rx_ok, "replies arrived on each NIC's own netdev");
+        TEST_ASSERT(quiet, "polled queues raise no interrupt");
+
+        // Interrupts allowed: every NIC raises its own
+        netdev_rx_irq_all(true);
+        icmp_get_stats(&s0);
+        send_pings(n, 2);
+
         bool irqs_ok = false;
+        deadline = timer_deadline_ms(3000);
         do
         {
             netdev_poll_all();
-            netdev_process_rx();
             icmp_get_stats(&s1);
 
             irqs_ok = true;
@@ -417,16 +468,26 @@ uint32_t test_pci_net(void)
                     irqs_ok = false;
         } while ((s1.rx_echo_reply - s0.rx_echo_reply < (uint64_t)n || !irqs_ok)
                  && !timer_deadline_expired(deadline));
-    
-        TEST_ASSERT_EQ(s1.rx_echo_reply - s0.rx_echo_reply, (uint64_t)n,
-                       "every NIC's gateway answers ping");
+        netdev_rx_irq_all(false);
+
         TEST_ASSERT(irqs_ok, "every NIC raised its own interrupt");
-    
-        bool rx_ok = true;
+
+        // Every buffer accounter for: on the ring, or free in the pool
+        bool ring_full = true, no_leak = true;
         for (int i = 0; i < n; ++i)
-            if (virtio_net_get(i)->netdev->stats.rx_packets == 0)
-                rx_ok = false;
-        TEST_ASSERT(rx_ok, "replies arrived on each NIC's own netdev");
+        {
+            struct virtio_net_dev *dev = virtio_net_get(i);
+            netdev_tx_burst(dev->netdev, 0, NULL, 0);
+
+            uint32_t posted = dev->rx_vq->size - dev->rx_vq->num_free;
+            if (dev->rx_vq->num_free != 0)
+                ring_full = false;
+            if (netbuf_pool_available(dev->rx_pool) + posted
+                != dev->rx_pool->capacity)
+                no_leak = false;
+        }
+        TEST_ASSERT(ring_full, "RX ring refilled completely");
+        TEST_ASSERT(no_leak, "no RX buffer leaked");
 
         // Unconfigure so later suites route only to their fake devices
         for (int i = 0; i < n; ++i)

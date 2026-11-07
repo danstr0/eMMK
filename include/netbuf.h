@@ -5,7 +5,7 @@
  * Inspired by Linux's sk_buff, a netbuf wraps a contiguous memory region
  * and maintains four pointers for zero-copy header manipulation:
  *
- * @code
+ * @code{.txt}
  *   head               data              tail               end
  *   |----headroom------|----payload------|----tailroom------|
  * @endcode
@@ -16,6 +16,26 @@
  * - @b TX: reserve headroom first, then @c put the payload, then
  *   @c push each header layer (transport → network → Ethernet)
  *   without copying.
+ *
+ * @par Memory layout (one allocation per packet)
+ * Metadata is embedded at the front of each 2 KiB buffer (DPDK mbuf
+ * style). Below @c head lies a small device headroom that the stack never
+ * sees, so a driver can always prepend its header (virtio-net: 12 bytes)
+ * to any netbuf without copying:
+ * @code{.txt}
+ *   | struct netbuf | device headroom | head ............... end |
+ *   0              128               144                     2048
+ * @endcode
+ *
+ * @par Where netbufs come from
+ * - @b Pools (@c netbuf_pool_create()): one per RX queue, carved from a
+ *   2 MiB-aligned block the direct map covers with a large page. The
+ *   owner core allocates and frees through a LIFO stack without locks or
+ *   atomics; a free on any other core goes through a lock-free list that
+ *   the owner reclaims. Used for every received packet.
+ * - @b Slab (@c netbuf_alloc()): everything else (locally built packets).
+ *   Usable from any core, and not meant for a per-packet fast path.
+ * - @b PMM: @c netbuf_alloc() of more than @c NETBUF_DATA_SIZE bytes.
  *
  * @par Lifecycle
  *   1. @c netbuf_alloc(size)          — allocate buffer + metadata.
@@ -40,13 +60,31 @@
 /// @{
 
 /// Default headroom reserved for TX packets (ETH + IP + TCP).
-#define NETBUF_HEADROOM  64
+#define NETBUF_HEADROOM           64
 
-/// Default total buffer size.
-#define NETBUF_SIZE    2048
+/// Total size of a standard netbuf: metadata, device headroom, and data.
+#define NETBUF_SIZE             2048
+
+/// Bytes reserved at the front of the buffer for `struct netbuf`.
+#define NETBUF_META_SIZE         128
+
+/// Headroom below @c head, for driver headers (never used by the stack).
+#define NETBUF_DEV_HEADROOM       16
+
+/// Offset of @c head from the start of the buffer.
+#define NETBUF_DATA_OFFSET      (NETBUF_META_SIZE + NETBUF_DEV_HEADROOM)
+
+/// Usable bytes between @c head and @c end of a standard netbuf.
+#define NETBUF_DATA_SIZE        (NETBUF_SIZE - NETBUF_DATA_OFFSET)
 
 /// Standard Ethernet MTU (excludes the Ethernet header).
-#define NETBUF_MTU     1500
+#define NETBUF_MTU              1500
+
+/// Size and alignment of a pool's backing block (one large page).
+#define NETBUF_POOL_BLOCK_SIZE  (2UL * 1024 * 1024)
+
+/// Upper bound on the buffers in one pool.
+#define NETBUF_POOL_MAX         (NETBUF_POOL_BLOCK_SIZE / NETBUF_SIZE)
 /// @}
 
 /// @name Protocol constants
@@ -113,8 +151,38 @@ struct netbuf
     /// Physical address of @c head (for DMA).
     uint64_t phys_addr;
 
+    /// Pool this buffer returns to, or @c NULL (slab / PMM).
+    struct netbuf_pool *pool;
+
     /// Reference count (freed when it reaches zero).
     int refcount;
+};
+
+_Static_assert(sizeof(struct netbuf) <= NETBUF_META_SIZE,
+               "struct netbuf must fit in NETBUF_META_SIZE");
+
+/**
+ * @brief A per-queue pool of netbufs in one 2 MiB block.
+ *
+ * Resides at the start of its own block. @c stack is touched only by the
+ * owner core, so allocation and same-core free are plain array accesses.
+ */
+struct netbuf_pool
+{
+    int      owner_core;    ///< Core that allocates from this pool.
+    uint32_t capacity;      ///< Buffers in the pool.
+    uint32_t free_count;    ///< Entries in @c stack.
+    uint64_t phys;          ///< Physical address of the block.
+
+    /// Buffers freed by other cores (lock-free list through @c nb->next);
+    /// the owner takes the whole list at once.
+    struct netbuf *remote_free;
+
+    uint64_t allocs;        ///< Successful allocations (owner only).
+    uint64_t alloc_fails;   ///< Allocations that found the pool empty.
+    uint64_t remote_frees;  ///< Frees from other cores.
+
+    struct netbuf *stack[NETBUF_POOL_MAX];  ///< LIFO of free buffers.
 };
 
 /// @name Initialization
@@ -123,8 +191,8 @@ struct netbuf
 /**
  * @brief Initialize the netbuf subsystem.
  *
- * Creates the slab caches used for netbuf metadata and data buffers.
- * Must be called before any @c netbuf_alloc() calls.
+ * Creates the slab cache used by @c netbuf_alloc(). Must be called before
+ * any @c netbuf_alloc() or @c netbuf_pool_create() calls.
  */
 void netbuf_init(void);
 /// @}
@@ -133,13 +201,17 @@ void netbuf_init(void);
 /// @{
 
 /**
- * @brief Allocate a new network buffer.
+ * @brief Allocate a new network buffer (slab, or PMM if oversized).
  *
- * @param size  Total buffer size in bytes (0 = default @c NETBUF_SIZE).
+ * Usable from any core. Counted by @c netbuf_slow_allocs(): the data
+ * path allocates from a pool instead.
+ *
+ * @param size  Usable bytes between @c head and @c end (@c 0 = default
+ *              @c NETBUF_DATA_SIZE).
  *
  * All pointers start at the beginning of the buffer
- * (@c data == @c tail == @c head). Call @c netbuf_reserve() to set
- * up headroom before adding data.
+ * (`data == tail == head`). Call @c netbuf_reserve() to set up headroom
+ * before adding data.
  *
  * @return Pointer to the netbuf, or @c NULL on failure.
  */
@@ -149,9 +221,14 @@ struct netbuf *netbuf_alloc(size_t size);
  * @brief Release a network buffer.
  *
  * Decrements the reference count — the buffer is actually freed only
- * when the count reaches zero.
+ * when the count reaches zero. Callable on any core, whatever the
+ * buffer's origin.
  */
 void netbuf_free(struct netbuf *nb);
+
+/// @return Number of slab / PMM allocations so far (the slow path). An
+///         echoed or forwarded packet adds none.
+uint64_t netbuf_slow_allocs(void);
 
 /**
  * @brief Create a deep copy of @p nb.
@@ -163,6 +240,52 @@ void netbuf_free(struct netbuf *nb);
  * @return New @c netbuf, or @c NULL on failure.
  */
 struct netbuf *netbuf_copy(struct netbuf *nb);
+/// @}
+
+/// @name Pools
+/// @{
+
+/**
+ * @brief Create a pool from a fresh 2 MiB-aligned PMM block.
+ *
+ * @param owner_core  The only core that may call @c netbuf_pool_alloc().
+ * @return The pool (all buffers free), or @c NULL if no block is free.
+ */
+struct netbuf_pool *netbuf_pool_create(int owner_core);
+
+/**
+ * @brief Return a pool's block to the PMM.
+ * @warning Every buffer dies with it: the caller guarantees that nothing
+ *          (including a device) still refers to one.
+ */
+void netbuf_pool_destroy(struct netbuf_pool *pool);
+
+/**
+ * @brief Take a buffer from @p pool (owner core only).
+ *
+ * The buffer is reset: `data == tail == head`, `refcount 1`. Data bytes
+ * are not cleared. @c phys_addr is fixed at pool creation.
+ *
+ * @return The buffer, or @c NULL if every buffer is in use.
+ */
+struct netbuf *netbuf_pool_alloc(struct netbuf_pool *pool);
+
+/**
+ * @brief Free buffers in @p pool (owner core only).
+ *
+ * Reclaims buffers other cores have freed.
+ */
+uint32_t netbuf_pool_available(struct netbuf_pool *pool);
+/// @}
+
+/// @name Device access
+/// @{
+
+/// Physical address of @c nb->data, for DMA.
+static inline uint64_t netbuf_data_phys(const struct netbuf *nb)
+{
+    return nb->phys_addr + (uint64_t)(nb->data - nb->head);
+}
 /// @}
 
 /// @name Headroom / tailroom queries
@@ -222,6 +345,20 @@ static inline void *netbuf_put(struct netbuf *nb, size_t len)
     nb->tail += len;
     nb->len  += len;
     return p;
+}
+
+/**
+ * @brief @c netbuf_put() that fails silently (device-supplied lengths on
+ *        the data path, where a bad frame must not reach the console).
+ * @return @c true if the region was added.
+ */
+static inline bool netbuf_put_quiet(struct netbuf *nb, size_t len)
+{
+    if (UNLIKELY(len > (size_t)(nb->end - nb->tail)))
+        return false;
+    nb->tail += len;
+    nb->len  += len;
+    return true;
 }
 
 /**

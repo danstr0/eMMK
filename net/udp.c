@@ -281,6 +281,20 @@ int udp_output(struct netbuf *nb, uint32_t dst_ip,
     return ip_output(nb, dst_ip, IPPROTO_UDP);
 }
 
+int udp_reply(struct netbuf *nb)
+{
+    if (!nb)
+        return -1;
+
+    uint32_t dst_ip   = nb->src_ip;
+    uint16_t dst_port = nb->src_port;
+    uint16_t src_port = nb->dst_port;
+
+    nb->dev = NULL;  // ip_output() routes the reply afresh
+
+    return udp_output(nb, dst_ip, dst_port, src_port);
+}
+
 int udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
              const void *data, size_t len)
 {

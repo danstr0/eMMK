@@ -22,16 +22,16 @@
  * (@c eth0, @c eth1, ..., in probe order).
  *
  * @par RX model
- * The driver pre-populates the RX queue with empty buffers. When the
- * device receives a packet, it fills a buffer and places it on the
- * used ring. The driver processes completions only by polling
- * (@c virtio_net_poll, reached through @c netdev_poll()), copying each
- * frame into a @c netbuf for @c netdev_receive(); the interrupt merely
- * wakes an idle core.
+ * The driver keeps the RX ring filled with netbufs from the queue's pool.
+ * When the device receives a packet, it writes straight into one and
+ * places it on the used ring. Completions are processed only by polling
+ * (@c netdev_rx_burst()), which hands out those same netbufs; there is
+ * no copy. The interrupt is suppressed unless a core is about to idle,
+ * and then it merely wakes that core.
  *
- * @warning Not thread-safe: @c virtio_net_send() and @c virtio_net_poll()
- *          for one device must be called from a single core (the TX
- *          owner; see @c ip_set_tx_owner()).
+ * @warning Not thread-safe: the bursts of one device must run on a single
+ *          core (the TX owner; see @c ip_set_tx_owner()), which must also
+ *          own the pool for RX.
  */
 
 #ifndef EMMK_VIRTIO_NET_H
@@ -40,6 +40,7 @@
 #include "types.h"
 #include "virtio.h"
 #include "idt.h"
+#include "netbuf.h"
 
 struct netdev;
 
@@ -137,16 +138,10 @@ struct virtio_net_config
 /// @name Configuration constants
 /// @{
 
-/**
- * RX buffer size (bytes).
- *
- * Must be large enough for @c virtio_net_hdr (12 bytes) + maximum
- * Ethernet frame (1514 bytes) + headroom.
- */
-#define VIRTIO_NET_RX_BUF_SIZE  2048
-
-/// Number of pre-allocated RX buffer slots.
-#define VIRTIO_NET_RX_BUFFERS   64
+_Static_assert(sizeof(struct virtio_net_hdr) <= NETBUF_DEV_HEADROOM,
+               "the virtio-net header must fit in the device headroom");
+_Static_assert(NETBUF_DATA_SIZE >= 1514,
+               "a pool buffer must hold a maximum Ethernet frame");
 
 /// Maximum number of virtio-net devices the driver binds.
 #define VIRTIO_NET_MAX_DEVICES  16
@@ -176,29 +171,19 @@ struct virtio_net_dev
     uint8_t irq_vector;
 
     /// PCI INTx line in use, or @c -1 (MSI-X or no interrupt).
-    int intx_line;
+    int     intx_line;
 
     /// Interrupts acknowledged for this device
     volatile uint64_t irq_count;
 
-    struct virtqueue *rx_vq;     ///< Receive virtqueue.
-    struct virtqueue *tx_vq;     ///< Transmit virtqueue.
+    struct virtqueue *rx_vq;      ///< Receive virtqueue.
+    struct virtqueue *tx_vq;      ///< Transmit virtqueue.
 
-    /// Pre-allocated RX buffer pool.
-    struct
-    {
-        void     *virt;          ///< Virtual address.
-        uint64_t  phys;          ///< Physical address.
-    } rx_bufs[VIRTIO_NET_RX_BUFFERS];
-    int rx_buf_count;            ///< Entries of @c rx_bufs allocated.
+    struct netbuf_pool *rx_pool;  ///< The RX queue's buffers.
 
-    /// Statistics.
-    uint64_t rx_packets;
-    uint64_t tx_packets;
-    uint64_t rx_bytes;
-    uint64_t tx_bytes;
+    /// Frames the device delivered that the driver had to drop. Packet
+    /// and byte counters reside in the netdev.
     uint64_t rx_dropped;
-    uint64_t tx_dropped;
 };
 /// @}
 
@@ -211,10 +196,10 @@ struct virtio_net_dev
  * Call before @pci_init() (which then probes every virtio-net device),
  * and after @c netdev_init() (each probe registers a netdev). For each
  * device, probe performs the virtio handshake (reset → features → queues
- * → DRIVER_OK), read the MAC adress, pre-fills the RX queue, sets up one
- * MSI-X vector from the allocator (legacy INTx as a fallback), and
- * registers and brings up a netdev. IPv4 configuration is left to the
- * caller (@c netdev_set_ip()).
+ * → DRIVER_OK), read the MAC adress, fills the RX ring from a new pool,
+ * sets up one MSI-X vector from the allocator (INTx as a fallback),
+ * and registers and brings up a netdev. IPv4 configuration is left to
+ * the caller (@c netdev_set_ip()).
  *
  * @return As @c pci_register_driver(): devices bound by this call (0
  *         before @c pci_init()), or @c -1 on failure.
@@ -229,59 +214,6 @@ int virtio_net_count(void);
  * @note Its netdev is @c ->netdev.
  */
 struct virtio_net_dev *virtio_net_get(int index);
-/// @}
-
-/// @name Transmit
-/// @{
-
-/**
- * @brief Transmit a raw Ethernet frame.
- *
- * Prepends a zeroed @c virtio_net_hdr, copies the payload into a
- * freshly allocated page, submits it to the TX queue, and kicks the
- * device. The caller's buffer is copied; @p data may be reused or
- * freed immediately after this call returns.
- *
- * @param dev   Virtio-net device.
- * @param data  Ethernet frame (starting at the destination MAC).
- * @param len   Frame length in bytes.
- * @return @c 0 on success, @c -1 on failure (queue full, alloc failure).
- */
-int virtio_net_send(struct virtio_net_dev *dev, const void *data, size_t len);
-/// @}
-
-/// @name Receive
-/// @{
-
-/**
- * @brief Receive a single packet (polling, copy-out).
- *
- * Checks the RX used ring for a completed buffer. If available,
- * copies the packet (without @c virtio_net_hdr) into @p buf and
- * refills the RX slot.
- *
- * @param dev     Virtio-net device.
- * @param buf     Destination buffer.
- * @param buflen  Size of @p buf in bytes.
- * @return Number of bytes copied (> 0), @c 0 if no packet available,
- *         @c -1 on error.
- *
- * @warning Bypasses the netdev: do not mix with @c virtio_net_poll() on
- *          a device whose netdev is being polled.
- */
-int virtio_net_receive(struct virtio_net_dev *dev, void *buf, size_t buflen);
-
-/**
- * @brief Process all pending RX and TX completions.
- *
- * Drains the RX used ring, copies each frame into a @c netbuf queued on
- * the device's netdev (@c netdev_receive()), refills RX slots (one kick),
- * and reclaims completed TX buffers. Normally reached through
- * @c netdev_poll().
- *
- * @param dev  Virtio-net device.
- */
-void virtio_net_poll(struct virtio_net_dev *dev);
 /// @}
 
 /// @name Status and configuration
@@ -309,9 +241,9 @@ bool virtio_net_link_up(struct virtio_net_dev *dev);
  * @brief ISR for a virtio-net MSI-X vector.
  *
  * Finds its device through the vector's context
- * (@c irq_vector_ctx(frame->vector)), reads the ISR status register and
- * sends EOI. Its only purpose is to wake a core idling in @c hlt; packets
- * are processed by the poll loop. Installed by @c pci_msix_alloc() during
+ * (@c irq_vector_ctx(frame->vector)), counts the interrupt and sends EOI.
+ * Its only purpose is to wake a core idling in @c hlt; packets are
+ * processed by the poll loop. Installed by @c pci_msix_alloc() during
  * probe.
  *
  * @param frame  Interrupt frame (from the IDT dispatcher).
