@@ -22,25 +22,107 @@ static void udp_test_handler(struct netbuf *nb) { netbuf_free(nb); }
 
 static int fake_sent;
 
-/// send op that "transmits" by counting; consumes @p nb per the contract.
-static int fake_send_ok(struct netdev *dev, struct netbuf *nb)
+/// tx burst that "transmits" by counting and takes ownership, per the
+/// contract.
+static uint16_t fake_tx_ok(struct netdev *dev, uint16_t qid,
+                           struct netbuf **pkts, uint16_t n)
 {
-    (void)dev;
-    fake_sent++;
-    netbuf_free(nb);
+    (void)dev; (void)qid;
+    for (uint16_t i = 0; i < n; ++i)
+    {
+        fake_sent++;
+        netbuf_free(pkts[i]);
+    }
+    return n;
+}
+
+/// tx_burst that accepts nothing; the packets stay the caller's.
+static uint16_t fake_tx_fail(struct netdev *dev, uint16_t qid,
+                             struct netbuf **pkts, uint16_t n)
+{
+    (void)dev; (void)qid; (void)pkts; (void)n;
     return 0;
 }
 
-/// send op that fails; still consumes @p nb, as the contract requires.
-static int fake_send_fail(struct netdev *dev, struct netbuf *nb)
+static const struct netdev_ops fake_ok_ops   = { .tx_burst = fake_tx_ok };
+static const struct netdev_ops fake_fail_ops = { .tx_burst = fake_tx_fail };
+
+// Fake NIC with a pool, for the zero-copy echo
+
+static struct netbuf *loop_rx;        ///< Frame rx_burst delivers next.
+static struct netbuf *loop_tx;        ///< Frame tx_burst received.
+static int            loop_tx_calls;  ///< tx_burst calls ("doorbells").
+static int            loop_tx_pkts;   ///< Packets given to tx_burst.
+
+static uint16_t loop_rx_burst(struct netdev *dev, uint16_t qid,
+                              struct netbuf **pkts, uint16_t max)
 {
-    (void)dev;
-    netbuf_free(nb);
-    return -1;
+    (void)dev; (void)qid;
+    if (!loop_rx || max == 0)
+        return 0;
+    pkts[0] = loop_rx;
+    loop_rx = NULL;
+    return 1;
 }
 
-static const struct netdev_ops fake_ok_ops   = { .send = fake_send_ok };
-static const struct netdev_ops fake_fail_ops = { .send = fake_send_fail };
+/// Keeps the packet, as a NIC does until the send completes.
+static uint16_t loop_tx_burst(struct netdev *dev, uint16_t qid,
+                              struct netbuf **pkts, uint16_t n)
+{
+    (void)dev; (void)qid;
+    if (n == 0)
+        return 0;
+    loop_tx_calls++;
+    loop_tx_pkts += n;
+    loop_tx = pkts[n - 1];
+    for (uint16_t i = 0; i + 1 < n; ++i)
+        netbuf_free(pkts[i]);
+    return n;
+}
+
+static const struct netdev_ops loop_ops =
+    { .rx_burst = loop_rx_burst, .tx_burst = loop_tx_burst };
+
+/// Echo handler, as in the demo.
+static void udp_test_echo(struct netbuf *nb) { udp_reply(nb); }
+
+/// Build an Ethernet + IP + UDP frame into a fresh @p pool buffer, as if
+/// the device had written it there.
+static struct netbuf *build_udp_frame(struct netbuf_pool *pool,
+                                      const uint8_t *dst_mac,
+                                      const uint8_t *src_mac,
+                                      uint32_t src_ip, uint32_t dst_ip,
+                                      uint16_t sport, uint16_t dport,
+                                      const char *msg, size_t len)
+{
+    struct netbuf *nb = netbuf_pool_alloc(pool);
+    uint8_t *f = netbuf_put(nb, ETH_HLEN + IP_HDR_MIN + UDP_HDR_SIZE + len);
+
+    struct ethhdr *eth = (struct ethhdr *)f;
+    eth_copy_addr(eth->dest, dst_mac);
+    eth_copy_addr(eth->src, src_mac);
+    eth->ethertype = htons(ETH_P_IP);
+
+    struct iphdr *ip = (struct iphdr *)(f + ETH_HLEN);
+    memset(ip, 0, IP_HDR_MIN);
+    ip->version  = IP_VERSION;
+    ip->ihl      = IP_HDR_MIN / 4;
+    ip->tot_len  = htons(IP_HDR_MIN + UDP_HDR_SIZE + len);
+    ip->ttl      = IP_DEFAULT_TTL;
+    ip->protocol = IPPROTO_UDP;
+    ip->saddr    = htonl(src_ip);
+    ip->daddr    = htonl(dst_ip);
+    ip->check    = ip_checksum(ip, IP_HDR_MIN);
+
+    struct udphdr *udp = (struct udphdr *)(f + ETH_HLEN + IP_HDR_MIN);
+    udp->src_port = htons(sport);
+    udp->dst_port = htons(dport);
+    udp->len      = htons(UDP_HDR_SIZE + len);
+    udp->checksum = 0;  // not computed: valid for IPv4
+    memcpy(udp + 1, msg, len);
+
+    return nb;
+}
 
 uint32_t test_net(void)
 {
@@ -297,6 +379,107 @@ uint32_t test_net(void)
         }
 
         netdev_unregister(fake);
+    }
+
+    // ── Zero-copy echo ──────────────────────────────────
+    {
+        static const uint8_t nic_mac[ETH_ALEN]  = {0x02, 0, 0, 0, 0, 0x22};
+        static const uint8_t peer_mac[ETH_ALEN] = {0x02, 0, 0, 0, 0, 0x33};
+        const uint32_t nic_ip  = IP4_ADDR(10, 7, 7, 2);
+        const uint32_t peer_ip = IP4_ADDR(10, 7, 7, 1);
+        static const char msg[] = "zero-copy echo";
+        const size_t msg_len = sizeof(msg) - 1;
+
+        struct netbuf_pool *pool = netbuf_pool_create(smp_core_id());
+        struct netdev *loop = netdev_alloc("loop0");
+        TEST_ASSERT(pool && loop, "fake NIC with pool");
+
+        if (pool && loop)
+        {
+            memcpy(loop->mac, nic_mac, ETH_ALEN);
+            loop->ops = &loop_ops;
+            netdev_register(loop);
+            netdev_set_up(loop);
+            netdev_set_ip(loop, nic_ip, IP4_ADDR(255, 255, 255, 0), 0);
+            arp_add_static(peer_ip, peer_mac, loop);
+            udp_bind(7, udp_test_echo);
+
+            loop_rx = build_udp_frame(pool, nic_mac, peer_mac,
+                                      peer_ip, nic_ip,
+                                      4000, 7, msg, msg_len);
+            struct netbuf *rx = loop_rx;
+            uint8_t *rx_frame = rx->data;
+
+            uint64_t slow   = netbuf_slow_allocs();
+            uint64_t allocs = pool->allocs;
+            loop_tx = NULL;
+
+            TEST_ASSERT_EQ(netdev_poll(loop), 1, "one packet processed");
+
+            TEST_ASSERT_EQ(netbuf_slow_allocs(), slow,
+                           "echo: zero slab / PMM allocations");
+            TEST_ASSERT_EQ(pool->allocs, allocs,
+                           "echo: zero pool allocations");
+            TEST_ASSERT_EQ((uintptr_t)loop_tx, (uintptr_t)rx,
+                           "echo: the received buffer is the transmitted one");
+
+            if (loop_tx)
+            {
+                struct netbuf *tx = loop_tx;
+                TEST_ASSERT_EQ((uintptr_t)tx->data, (uintptr_t)rx_frame,
+                               "echo: frame at the same address");
+
+                struct ethhdr *eth = (struct ethhdr *)tx->data;
+                TEST_ASSERT_MEMEQ(eth->dest, peer_mac, ETH_ALEN,
+                                  "echo: Ethernet dest is the sender");
+                TEST_ASSERT_MEMEQ(eth->src, nic_mac, ETH_ALEN,
+                                  "echo: Ethernet src is the NIC");
+
+                struct iphdr *ip = (struct iphdr *)(tx->data + ETH_HLEN);
+                TEST_ASSERT_EQ(ntohl(ip->saddr), nic_ip, "echo: IP src");
+                TEST_ASSERT_EQ(ntohl(ip->daddr), peer_ip, "echo: IP dst");
+                TEST_ASSERT_EQ(ip_checksum(ip, IP_HDR_MIN), 0,
+                               "echo: IP checksum valid");
+
+                struct udphdr *udp = (struct udphdr *)(ip + 1);
+                TEST_ASSERT_EQ(ntohs(udp->src_port), 7, "echo: source port");
+                TEST_ASSERT_EQ(ntohs(udp->dst_port), 4000, "echo: dest port");
+                TEST_ASSERT_EQ(ntohs(udp->len), UDP_HDR_SIZE + msg_len,
+                               "echo: UDP length");
+                TEST_ASSERT(udp->checksum != 0, "echo: UDP checksum set");
+                TEST_ASSERT_MEMEQ(udp + 1, msg, msg_len,
+                                  "echo: payload intact");
+
+                netbuf_free(tx);
+            }
+
+            // A burst of replies shares one doorbell
+            loop_tx_calls = 0;
+            loop_tx_pkts  = 0;
+            netdev_tx_defer_begin();
+            for (int i = 0; i < 5; ++i)
+            {
+                struct netbuf *nb = netbuf_pool_alloc(pool);
+                netbuf_put(nb, 60);
+                nb->dev = loop;
+                TEST_ASSERT_EQ(netdev_send(loop, nb), 0,
+                               "held send accepted");
+            }
+            TEST_ASSERT_EQ(loop_tx_calls, 0, "nothing posted while held");
+            netdev_tx_defer_end();
+            TEST_ASSERT_EQ(loop_tx_pkts, 5, "held packets all posted");
+            TEST_ASSERT_EQ(loop_tx_calls, 1, "one burst, one doorbell");
+            netbuf_free(loop_tx);
+
+            TEST_ASSERT_EQ(netbuf_pool_available(pool), pool->capacity,
+                           "pool whole again");
+
+            udp_unbind(7);
+            netdev_unregister(loop);
+        }
+
+        kfree(loop);
+        netbuf_pool_destroy(pool);
     }
 
     // ── Default names: lowest free ethN ─────────────────
