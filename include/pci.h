@@ -133,9 +133,13 @@
 #define PCI_VENDOR_VIRTIO   0x1AF4
 
 // Virtio transitional device IDs (0x1000-0x103F)
+// eMMK drives them through the modern interface only
 #define VIRTIO_DEV_NET      0x1000  ///< Network card.
 #define VIRTIO_DEV_BLOCK    0x1001  ///< Block device.
 #define VIRTIO_DEV_CONSOLE  0x1003  ///< Console.
+
+// Virtio modern-only device IDs (0x1040 + virtio device type)
+#define VIRTIO_DEV_NET_MODERN  0x1041  ///< Network card.
 /// @}
 
 /// @name Capability IDs
