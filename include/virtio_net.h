@@ -2,8 +2,8 @@
  * @file virtio_net.h
  * @brief Virtio network device driver interface.
  *
- * Drives a virtio-net device using the legacy PCI interface. Uses two
- * virtqueues for data transfer:
+ * Drives virtio-net devices (transitional or modern-only) through the
+ * virtio 1.x PCI transport. Uses two virtqueues for data transfer:
  * - Queue 0 (RX): device writes received packets (pre-filled with
  *   buffers by the driver).
  * - Queue 1 (TX): driver writes packets to send.
@@ -43,25 +43,34 @@
 
 struct netdev;
 
-/// @name Virtio-net feature bits
+/// @name Virtio-net feature bits (64-bit feature space)
 /// @{
-#define VIRTIO_NET_F_CSUM        (1U << 0)   ///< Host handles TX checksum.
-#define VIRTIO_NET_F_GUEST_CSUM  (1U << 1)   ///< Guest handles RX checksum.
-#define VIRTIO_NET_F_MAC         (1U << 5)   ///< Device has given MAC.
-#define VIRTIO_NET_F_GSO         (1U << 6)   ///< Deprecated GSO support.
-#define VIRTIO_NET_F_GUEST_TSO4  (1U << 7)   ///< Guest can receive TSOv4.
-#define VIRTIO_NET_F_GUEST_TSO6  (1U << 8)   ///< Guest can receive TSOv6.
-#define VIRTIO_NET_F_GUEST_ECN   (1U << 9)   ///< Guest can receive TSO+ECN.
-#define VIRTIO_NET_F_GUEST_UFO   (1U << 10)  ///< Guest can receive UFO.
-#define VIRTIO_NET_F_HOST_TSO4   (1U << 11)  ///< Host can receive TSOv4.
-#define VIRTIO_NET_F_HOST_TSO6   (1U << 12)  ///< Host can receive TSOv6.
-#define VIRTIO_NET_F_HOST_ECN    (1U << 13)  ///< Host can receive TSO+ECN.
-#define VIRTIO_NET_F_HOST_UFO    (1U << 14)  ///< Host can receive UFO.
-#define VIRTIO_NET_F_MRG_RXBUF   (1U << 15)  ///< Merge RX buffers.
-#define VIRTIO_NET_F_STATUS      (1U << 16)  ///< Config status field valid.
-#define VIRTIO_NET_F_CTRL_VQ     (1U << 17)  ///< Control virtqueue present.
-#define VIRTIO_NET_F_CTRL_RX     (1U << 18)  ///< Control RX mode.
-#define VIRTIO_NET_F_CTRL_VLAN   (1U << 19)  ///< Control VLAN filtering.
+#define VIRTIO_NET_F_CSUM        (1UL << 0)   ///< Host handles TX checksum.
+#define VIRTIO_NET_F_GUEST_CSUM  (1UL << 1)   ///< Guest handles RX checksum.
+#define VIRTIO_NET_F_MAC         (1UL << 5)   ///< Device has given MAC.
+#define VIRTIO_NET_F_GSO         (1UL << 6)   ///< Deprecated GSO support.
+#define VIRTIO_NET_F_GUEST_TSO4  (1UL << 7)   ///< Guest can receive TSOv4.
+#define VIRTIO_NET_F_GUEST_TSO6  (1UL << 8)   ///< Guest can receive TSOv6.
+#define VIRTIO_NET_F_GUEST_ECN   (1UL << 9)   ///< Guest can receive TSO+ECN.
+#define VIRTIO_NET_F_GUEST_UFO   (1UL << 10)  ///< Guest can receive UFO.
+#define VIRTIO_NET_F_HOST_TSO4   (1UL << 11)  ///< Host can receive TSOv4.
+#define VIRTIO_NET_F_HOST_TSO6   (1UL << 12)  ///< Host can receive TSOv6.
+#define VIRTIO_NET_F_HOST_ECN    (1UL << 13)  ///< Host can receive TSO+ECN.
+#define VIRTIO_NET_F_HOST_UFO    (1UL << 14)  ///< Host can receive UFO.
+#define VIRTIO_NET_F_MRG_RXBUF   (1UL << 15)  ///< Merge RX buffers.
+#define VIRTIO_NET_F_STATUS      (1UL << 16)  ///< Config status field valid.
+#define VIRTIO_NET_F_CTRL_VQ     (1UL << 17)  ///< Control virtqueue present.
+#define VIRTIO_NET_F_CTRL_RX     (1UL << 18)  ///< Control RX mode.
+#define VIRTIO_NET_F_CTRL_VLAN   (1UL << 19)  ///< Control VLAN filtering.
+#define VIRTIO_NET_F_MQ          (1UL << 22)  ///< Multiqueue.
+#define VIRTIO_NET_F_HASH_REPORT (1UL << 57)  ///< Device reports flow hash.
+#define VIRTIO_NET_F_RSS         (1UL << 60)  ///< Device-side RSS
+/// @}
+
+/// @name Device configuration offsets
+/// @{
+#define VIRTIO_NET_CFG_MAC     0  ///< 6 bytes: MAC address.
+#define VIRTIO_NET_CFG_STATUS  6  ///< 16: @c VIRTIO_NET_S_*.
 /// @}
 
 /// @name Virtio-net header
@@ -81,8 +90,14 @@ struct virtio_net_hdr
     uint16_t gso_size;     ///< Maximum segment size for GSO.
     uint16_t csum_start;   ///< Offset to begin checksumming.
     uint16_t csum_offset;  ///< Offset to place the checksum.
-    // If VIRTIO_NET_F_MRG_RXBUF: uint16_t num_buffers;
+    
+    /// RX: buffers used by this packet (1 without MRG_RXBUF);
+    /// TX: 0.
+    uint16_t num_buffers;
 } PACKED;
+
+_Static_assert(sizeof(struct virtio_net_hdr) == 12,
+               "virtio 1.x net header is 12 bytes");
 
 #define VIRTIO_NET_HDR_SIZE  sizeof(struct virtio_net_hdr)
 
@@ -125,7 +140,7 @@ struct virtio_net_config
 /**
  * RX buffer size (bytes).
  *
- * Must be large enough for @c virtio_net_hdr (10 bytes) + maximum
+ * Must be large enough for @c virtio_net_hdr (12 bytes) + maximum
  * Ethernet frame (1514 bytes) + headroom.
  */
 #define VIRTIO_NET_RX_BUF_SIZE  2048
@@ -144,13 +159,6 @@ struct virtio_net_config
 #define VIRTIO_NET_CTQ  2  ///< Control queue (optional, unused).
 /// @}
 
-/// @name MSI-X vector registers
-/// @{
-#define VIRTIO_PCI_CONFIG_MSIX_VECTOR  20  ///< 16-bit: MSI-X entry for config changes.
-#define VIRTIO_PCI_QUEUE_MSIX_VECTOR   22  ///< 16-bit: MSI-X entry for the selected queue.
-#define VIRTIO_MSI_NO_VECTOR           0xFFFF  ///< Disable MSI-X for this queue/config.
-/// @}
-
 /// @name Device structure
 /// @{
 
@@ -167,7 +175,7 @@ struct virtio_net_dev
     /// IDT vector that wakes the core for this device (0 = none).
     uint8_t irq_vector;
 
-    /// Legacy INTx line in use, or @c -1 (MSI-X or no interrupt).
+    /// PCI INTx line in use, or @c -1 (MSI-X or no interrupt).
     int intx_line;
 
     /// Interrupts acknowledged for this device

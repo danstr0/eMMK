@@ -47,20 +47,35 @@ LDFLAGS := -nostdlib               \
 ## Guest RAM (e.g., MEM=4G)
 MEM ?= 128M
 
-## Number of virtio-net NICs; each is its own slirp network, only the
-## first forwards host UDP port 8080 (demo echo)
-NICS ?= 2
-
 QEMU_BASE := -m $(MEM) -serial stdio -display none
-QEMU_NET  := -device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=udp::8080-:7
-ifeq ($(NICS),2)
-QEMU_NET  += -device virtio-net-pci,netdev=net1 -netdev user,id=net1,net=10.0.3.0/24
+
+## Number of virtio-net NICs (1..16)
+## - each is its own slirp network: NIC n gets 10.0.(2+n).0/24
+## - only the first forwards host UDP port 8080 (demo echo)
+NICS ?= 2
+ifeq ($(filter $(NICS),$(shell seq 1 16)),)
+$(error NICS must be 1..16 (got '$(NICS)'))
 endif
+
+## DISABLE_LEGACY=1: modern-only virtio-net devices
+## - default: QEMU's transitional device; kernel uses its modern interface
+##   either way
+DISABLE_LEGACY ?= 0
+ifeq ($(DISABLE_LEGACY),1)
+NIC_OPTS := ,disable-legacy=on
+endif
+
+## $(call qemu_nic, n): QEMU arguments for NIC n
+comma := ,
+qemu_nic = -device virtio-net-pci,netdev=net$(1)$(NIC_OPTS) \
+           -netdev user,id=net$(1),net=10.0.$(shell echo $$((2 + $(1)))).0/24$(if $(filter 0,$(1)),$(comma)hostfwd=udp::8080-:7)
+
+QEMU_NET  := $(foreach n,$(shell seq 0 $$(($(NICS) - 1))),$(call qemu_nic,$(n)))
 QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
 ## KVM=1 -> hardware virtualization with the host CPU model
 ifeq ($(KVM),1)
-QEMU_BASE += -enable-kvm -cpu host
+QEMU_BASE += -enable-kvm -cpu host,migratable=no,+invtsc
 endif
 
 # ── Source files ────────────────────────────────────────────────────────

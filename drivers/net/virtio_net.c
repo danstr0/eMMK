@@ -2,15 +2,17 @@
  * @file virtio_net.c
  * @brief Virtio network device driver.
  *
- * @par Probe sequence (legacy transport), once per virtio-net device:
- * 1. @c virtio_device_init() — reset, ACKNOWLEDGE, DRIVER.
- * 2. Negotiate features (MAC, STATUS) and read the MAC.
- * 3. Create RX and TX virtqueues.
- * 4. Pre-fill the RX queue with empty buffers.
- * 5. Interrupt: one MSI-X entry with a vector from the kernel allocator
- *    (or the shared legacy INTx line as a fallback).
- * 6. Set DRIVER_OK — the device is live.
- * 7. Register a @c netdev (@c eth0, @c eth1, ...) for it.
+ * @par Probe sequence (modern transport), once per virtio-net device:
+ * 1. @c virtio_device_init() — map the register regions, reset,
+ *    ACKNOWLEDGE, DRIVER.
+ * 2. Negotiate features (VERSION_1, MAC, STATUS) with FEATURES_OK, and
+ *    read the MAC.
+ * 3. Interrupt: one MSI-X entry with a vector from the kernel allocator
+ *    (or the shared legacy INTx line as a fallback). Before the queues:
+ *    each queue's MSI-X entry is programmed when it is created.
+ * 4. Create RX and TX virtqueues and pre-fill RX with empty buffers.
+ * 5. Set DRIVER_OK — the device is live.
+ * 6. Register a @c netdev (@c eth0, @c eth1, ...) for it.
  *
  * @par Transmit path
  * Allocate a page, copy @c virtio_net_hdr + packet data, add to the TX
@@ -45,8 +47,8 @@
 static struct virtio_net_dev *instances[VIRTIO_NET_MAX_DEVICES];
 static int instance_count = 0;
 
-/// Vector allocated for each legacy INTx line (0 = none yet). Several
-/// devices may share one line; its handler acknowledges all of them.
+/// Vector allocated for each INTx line (0 = none yet). Several devices
+/// may share one line; its handler acknowledges all of them.
 static uint8_t intx_vectors[16];
 
 // ── RX buffer management ───────────────────────────────────────────────
@@ -138,19 +140,18 @@ void virtio_net_irq_handler(struct interrupt_frame *frame)
 {
     struct virtio_net_dev *dev = irq_vector_ctx(frame->vector);
 
-    // Read ISR status to acknowledge the interrupt (read clears it)
+    // With MSI-X the device does not use the ISR status register; there
+    // is nothing to acknowledge at the device
     if (dev)
-    {
-        (void)inb(dev->vdev->io_base + VIRTIO_PCI_ISR_STATUS);
         dev->irq_count++;
-    }
 
     lapic_eoi();
 }
 
 /**
- * @brief Handler for a legacy INTx line, possibly shared by several
- *        virtio-net devices: acknowledges every device on the line.
+ * @brief Handler for an INTx line, possibly shared by several virtio-net
+ *        devices: acknowledges every device on the line (reading the ISR
+ *        status clears it and deasserts the line).
  *
  * The vector's context is the line number + 1 (so line 0 is not NULL).
  */
@@ -161,8 +162,7 @@ static void virtio_net_intx_handler(struct interrupt_frame *frame)
     for (int i = 0; i < VIRTIO_NET_MAX_DEVICES; ++i)
     {
         struct virtio_net_dev *dev = instances[i];
-        if (dev && dev->intx_line == line
-            && inb(dev->vdev->io_base + VIRTIO_PCI_ISR_STATUS))
+        if (dev && dev->intx_line == line && virtio_read_isr(dev->vdev))
             dev->irq_count++;
     }
 
@@ -170,35 +170,22 @@ static void virtio_net_intx_handler(struct interrupt_frame *frame)
 }
 
 /**
- * @brief Route both virtqueues to one MSI-X entry with its own vector.
+ * @brief Allocate one MSI-X entry (entry 0) with its own vector.
+ *
+ * Both virtqueues are pointed at entry 0 when they are created;
+ * configuration-change interrupts are disabled.
+ *
  * @return @c 0 on success, @c -1 if MSI-X could not be set up.
  */
 static int setup_msix(struct virtio_net_dev *dev)
 {
     struct pci_device *pci = dev->pci;
-    struct virtio_device *vdev = dev->vdev;
 
     if (pci_msix_alloc(pci, 1, virtio_net_irq_handler, dev) < 0)
         return -1;
 
-    // Device config now sits after the MSI-X vector registers
-    vdev->config_offset = VIRTIO_PCI_CONFIG_MSIX;
-
-    // Tell the virtio device which MSI-X entry each queue uses
-    static const uint16_t queues[] = { VIRTIO_NET_RXQ, VIRTIO_NET_TXQ };
-    for (int i = 0; i < 2; ++i)
-    {
-        outw(vdev->io_base + VIRTIO_PCI_QUEUE_SEL, queues[i]);
-        outw(vdev->io_base + VIRTIO_PCI_QUEUE_MSIX_VECTOR, 0);
-        if (inw(vdev->io_base + VIRTIO_PCI_QUEUE_MSIX_VECTOR)
-            == VIRTIO_MSI_NO_VECTOR)
-            kprintf("[VIRTIO-NET] WARNING: Device rejected queue %u "
-                    "MSI-X entry\n", queues[i]);
-    }
-
-    // Disable config-change interrupts
-    outw(vdev->io_base + VIRTIO_PCI_CONFIG_MSIX_VECTOR,
-         VIRTIO_MSI_NO_VECTOR);
+    if (virtio_set_config_msix(dev->vdev, VIRTIO_MSI_NO_VECTOR) < 0)
+        kprintf("[VIRTIO-NET] WARNING: config MSI-X vector not cleared\n");
 
     dev->irq_vector = pci->msix_vectors[0];
     kprintf("[VIRTIO-NET] Using MSI-X vector %u\n", dev->irq_vector);
@@ -206,7 +193,7 @@ static int setup_msix(struct virtio_net_dev *dev)
 }
 
 /**
- * @brief Fall back to the device's legacy INTx line via the I/O APIC.
+ * @brief Fall back to the device's INTx line via the I/O APIC.
  * @return @c 0 on success, @c -1 if there is no usable line.
  */
 static int setup_intx(struct virtio_net_dev *dev)
@@ -230,7 +217,7 @@ static int setup_intx(struct virtio_net_dev *dev)
 
     dev->intx_line = line;
     dev->irq_vector = intx_vectors[line];
-    kprintf("[VIRTIO-NET] Using legacy IRQ %u (vector %u)\n",
+    kprintf("[VIRTIO-NET] Using INTx IRQ %u (vector %u)\n",
             line, dev->irq_vector);
     return 0;
 }
@@ -325,20 +312,35 @@ static int virtio_net_probe(struct pci_device *pci)
     dev->intx_line  = -1;
     dev->irq_vector = 0;
 
-    // Negotiate features
-    uint32_t desired = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
-    uint32_t negotiated = virtio_negotiate_features(vdev, desired);
+    // Negotiate features (VERSION_1 is implied) and confirm FEATURES_OK
+    if (virtio_negotiate_features(vdev,
+                                  VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS) < 0)
+        goto fail;
 
-    // Read the MAC address (if the feature was negotiated).
-    if (negotiated & VIRTIO_NET_F_MAC)
-        for (int i = 0; i < 6; ++i)
-            dev->mac[i] = virtio_read_config8(vdev, i);
+    // Read the MAC address (if the feature was negotiated), consistently
+    // with respect to config_generation
+    if ((vdev->features & VIRTIO_NET_F_MAC)
+        && virtio_read_config(vdev, VIRTIO_NET_CFG_MAC,
+                              dev->mac, ETH_ALEN) < 0)
+        kprintf("[VIRTIO-NET] WARNING: MAC outside device config\n");
 
     kprintf("[VIRTIO-NET] MAC: %s\n", ETH_FMT(dev->mac));
 
+    // Claim the slot before interrupts can fire
+    instances[instance_count] = dev;
+
+    // Interrupt: MSI-X entry 0 with an allocated vector, else INTx. Set
+    // up before the queues, which are created pointing at the entry
+    uint16_t entry = VIRTIO_MSI_NO_VECTOR;
+    if (pci->cap_msix && setup_msix(dev) == 0)
+        entry = 0;
+    else if (setup_intx(dev) < 0)
+        kprintf("[VIRTIO_NET] WARNING: No interrupt configured "
+                "(polling only)\n");
+
     // Create RX and TX virtqueues (registered in vdev->queues[])
-    dev->rx_vq = virtqueue_create(vdev, VIRTIO_NET_RXQ);
-    dev->tx_vq = dev->rx_vq ? virtqueue_create(vdev, VIRTIO_NET_TXQ)
+    dev->rx_vq = virtqueue_create(vdev, VIRTIO_NET_RXQ, entry);
+    dev->tx_vq = dev->rx_vq ? virtqueue_create(vdev, VIRTIO_NET_TXQ, entry)
                             : NULL;
     if (!dev->tx_vq)
     {
@@ -349,22 +351,15 @@ static int virtio_net_probe(struct pci_device *pci)
     if (virtio_net_setup_rx_buffers(dev) < 0)
         goto fail;
 
-    // Claim the slot before interrupts can fire
-    instances[instance_count] = dev;
-
-    // Interrupt: MSI-X with an allocated vector, else legacy INTx
-    if (!(pci->cap_msix && setup_msix(dev) == 0) && setup_intx(dev) < 0)
-        kprintf("[VIRTIO-NET] WARNING: No interrupt configured "
-                "(polling only)\n");
-
     // Mark the device as live
     virtio_set_status(vdev, VIRTIO_STATUS_DRIVER_OK);
 
     // Verify the device accepted the configuration
-    uint8_t status = inb(vdev->io_base + VIRTIO_PCI_DEVICE_STATUS);
-    if (status & VIRTIO_STATUS_FAILED)
+    uint8_t status = virtio_get_status(vdev);
+    if (status & (VIRTIO_STATUS_FAILED | VIRTIO_STATUS_NEEDS_RESET))
     {
-        kprintf("[VIRTIO-NET] ERROR: Device rejected configuration\n");
+        kprintf("[VIRTIO-NET] ERROR: Device rejected configuration "
+                "(status=0x%x)\n", status);
         goto fail;
     }
 
@@ -384,7 +379,6 @@ fail:
     instances[instance_count] = NULL;
     if (dev->intx_line < 0)
         pci_msix_free(pci);  // INTx vectors stay with their line
-    vdev->config_offset = VIRTIO_PCI_CONFIG;
     free_rx_buffers(dev);
     if (dev->tx_vq)
         virtqueue_destroy(dev->tx_vq);
@@ -397,7 +391,8 @@ fail:
 
 static const struct pci_device_id virtio_net_ids[] =
 {
-    { PCI_VENDOR_VIRTIO, VIRTIO_DEV_NET },
+    { PCI_VENDOR_VIRTIO, VIRTIO_DEV_NET },         // transitional
+    { PCI_VENDOR_VIRTIO, VIRTIO_DEV_NET_MODERN },  // modern-only
     { 0, 0 },
 };
 
@@ -599,7 +594,7 @@ bool virtio_net_link_up(struct virtio_net_dev *dev)
         return true;
 
     // Link status is at offset 6 in the device-specific config
-    uint16_t status = virtio_read_config16(dev->vdev, 6);
+    uint16_t status = virtio_read_config16(dev->vdev, VIRTIO_NET_CFG_STATUS);
     return (status & VIRTIO_NET_S_LINK_UP) != 0;
 }
 

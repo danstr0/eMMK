@@ -17,6 +17,7 @@
 #include "virtio.h"
 #include "virtio_net.h"
 #include "netdev.h"
+#include "io.h"
 #include "icmp.h"
 #include "timer.h"
 #include "format.h"
@@ -42,6 +43,7 @@ static int probe_accept(struct pci_device *dev)
 static const struct pci_device_id virtio_net_only[] =
 {
     { PCI_VENDOR_VIRTIO, VIRTIO_DEV_NET },
+    { PCI_VENDOR_VIRTIO, VIRTIO_DEV_NET_MODERN },
     { 0, 0 },
 };
 
@@ -83,11 +85,19 @@ uint32_t test_pci_net(void)
     TEST_ASSERT(bridge != NULL, "host bridge found");
 
     // ── Every virtio-net function was probed ────────────
-    int nfound = 0;
+    // Transitional (QEMU's default) and modern-only
+    int nfound = 0, nmodern = 0;
     for (struct pci_device *p = NULL;
          (p = pci_find_device(PCI_VENDOR_VIRTIO,
                               VIRTIO_DEV_NET, p)) != NULL; )
         nfound++;
+    for (struct pci_device *p = NULL;
+         (p = pci_find_device(PCI_VENDOR_VIRTIO,
+                              VIRTIO_DEV_NET_MODERN, p)) != NULL; )
+        nmodern++;
+    nfound += nmodern;
+    if (nmodern)
+        kprintf("  %d modern-only device(s)\n", nmodern);
     TEST_ASSERT(nfound >= 1, "virtio-net PCI device found");
     TEST_ASSERT_EQ(virtio_net_count(), nfound,
                    "every virtio-net device probed (not just the first)");
@@ -105,13 +115,33 @@ uint32_t test_pci_net(void)
     // ── Per-device state ────────────────────────────────
     bool bound_ok = true, mac_ok = true, link_ok = true, queues_ok = true;
     bool netdev_ok = true, vector_ok = true, vecreg_ok = true, stats_ok = true;
+    bool regions_ok = true, features_ok = true, status_ok = true;
     for (int i = 0; i < virtio_net_count(); ++i)
     {
         struct virtio_net_dev *dev = virtio_net_get(i);
         struct pci_device *pci = dev->pci;
+        struct virtio_device *vdev = dev->vdev;
     
         if (!pci->driver || pci->driver_data != dev || dev->index != i)
             bound_ok = false;
+
+        // Modern transport: every register region mapped
+        if (!vdev->common || !vdev->notify || !vdev->isr || !vdev->device_cfg
+            || vdev->device_cfg_len < 8 || vdev->notify_off_multiplier == 0
+            || vdev->max_queues < 2)
+            regions_ok = false;
+
+        // VERSION_1 always; MAC and STATUS are offered by QEMU
+        uint64_t want = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+        if ((vdev->features & want) != want)
+            features_ok = false;
+
+        uint8_t st = virtio_get_status(vdev);
+        uint8_t live = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+                     | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK;
+        if ((st & live) != live
+            || (st & (VIRTIO_STATUS_FAILED | VIRTIO_STATUS_NEEDS_RESET)))
+            status_ok = false;
 
         // QEMU assigns 52:52:00:xx:xx:xx
         if (dev->mac[0] != 0x52
@@ -141,7 +171,7 @@ uint32_t test_pci_net(void)
             vector_ok = false;
         else if (dev->intx_line >= 0)
         {
-            kprintf("  %s uses legacy INTx line %d\n", dev->netdev->name,
+            kprintf("  %s uses INTx line %d\n", dev->netdev->name,
                     dev->intx_line);
             if (irq_vector_ctx(dev->irq_vector) != (void *)(uintptr_t)
                                                    (dev->intx_line + 1))
@@ -155,13 +185,15 @@ uint32_t test_pci_net(void)
                 vector_ok = false;
 
             // Both queues signal MSI-X entry 0
-            uint16_t io = dev->vdev->io_base;
-            outw(io + VIRTIO_PCI_QUEUE_SEL, VIRTIO_NET_RXQ);
-            uint16_t rwv = inw(io + VIRTIO_PCI_QUEUE_MSIX_VECTOR);
-            outw(io + VIRTIO_PCI_QUEUE_SEL, VIRTIO_NET_TXQ);
-            uint16_t txv = inw(io + VIRTIO_PCI_QUEUE_MSIX_VECTOR);
-            if (rwv != 0 || txv != 0
-                || inw(io + VIRTIO_PCI_CONFIG_MSIX_VECTOR) != VIRTIO_MSI_NO_VECTOR)
+            volatile uint8_t *c = vdev->common;
+            mmio_write16(c + VIRTIO_COMMON_Q_SELECT, VIRTIO_NET_RXQ);
+            uint16_t rxv = mmio_read16(c + VIRTIO_COMMON_Q_MSIX);
+            uint16_t rxe = mmio_read16(c + VIRTIO_COMMON_Q_ENABLE);
+            mmio_write16(c + VIRTIO_COMMON_Q_SELECT, VIRTIO_NET_TXQ);
+            uint16_t txv = mmio_read16(c + VIRTIO_COMMON_Q_MSIX);
+            uint16_t txe = mmio_read16(c + VIRTIO_COMMON_Q_ENABLE);
+            if (rxv != 0 || txv != 0 || rxe != 1 || txe != 1
+                || mmio_read16(c + VIRTIO_COMMON_MSIX) != VIRTIO_MSI_NO_VECTOR)
                 vecreg_ok = false;
         }
 
@@ -174,7 +206,10 @@ uint32_t test_pci_net(void)
     TEST_ASSERT(queues_ok, "RX and TX queues created with descriptors");
     TEST_ASSERT(netdev_ok, "each device has its own netdev ethN");
     TEST_ASSERT(vector_ok, "each device has an allocated MSI-X vector");
-    TEST_ASSERT(vecreg_ok, "queue/config MSI-X registers at offsets 22/20");
+    TEST_ASSERT(vecreg_ok, "queues enabled on MSI-X entry 0");
+    TEST_ASSERT(regions_ok, "common/notify/ISR/device regions mapped");
+    TEST_ASSERT(features_ok, "VERSION_1, MAC, and STATUS negotiated");
+    TEST_ASSERT(status_ok, "status: FEATURES_OK and DRIVER_OK, no FAILED");
     TEST_ASSERT(stats_ok, "stats start at zero");
 
     // ── Distinct MACs and vectors across devices ────────
@@ -199,9 +234,23 @@ uint32_t test_pci_net(void)
 
     // ── BARs and pci_map_bar() ──────────────────────────
     {
-        TEST_ASSERT(vpci->bar[0].is_io && vpci->bar[0].base != 0,
-                    "virtio-net BAR0 is I/O");
-        TEST_ASSERT(pci_map_bar(vpci, 0) == NULL, "I/O BAR is not mapped");
+        // A transitional device still has its legacy I/O BAR (unused);
+        // a modern-only one has none
+        if (vpci->device_id == VIRTIO_DEV_NET)
+        {
+            TEST_ASSERT(vpci->bar[0].is_io && vpci->bar[0].base != 0,
+                        "transitional virtio-net BAR0 is I/O");
+            TEST_ASSERT(pci_map_bar(vpci, 0) == NULL,
+                        "I/O BAR is not mapped");
+        }
+        else
+        {
+            bool no_io = true;
+            for (int b = 0; b < 6; ++b)
+                if (vpci->bar[b].size && vpci->bar[b].is_io)
+                    no_io = false;
+            TEST_ASSERT(no_io, "modern-only virtio-net has no I/O BAR");
+        }
         TEST_ASSERT(pci_map_bar(vpci, 6) == NULL, "BAR index 6 rejected");
     
         bool sizes_ok = true, upper_ok = true;
