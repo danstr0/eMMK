@@ -427,7 +427,13 @@ bool virtqueue_has_buf(struct virtqueue *vq);
 /// Suppress device interrupts for @p vq.
 void virtqueue_disable_interrupts(struct virtqueue *vq);
 
-/// Re-enable device interrupts for @p vq.
+/**
+ * @brief Re-enable device interrupts for @p vq.
+ *
+ * Includes a full fence. A buffer completed just before the device saw
+ * the flag raises no interrupt, so check the used ring once more before
+ * sleeping.
+ */
 void virtqueue_enable_interrupts(struct virtqueue *vq);
 /// @}
 
