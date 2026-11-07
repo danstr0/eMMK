@@ -145,20 +145,22 @@ static void dispatch_one(struct netbuf *nb)
 
 void dispatch_rx(void)
 {
-    struct netdev *dev = netdev_get_default();
-    if (!dev)
-        return;
+    // Everything sent below shares one doorbell per device
+    netdev_tx_defer_begin();
 
     for (int i = 0; i < netdev_count(); ++i)
     {
-        struct netdev *dev = netdev_get(i);
-        struct netbuf *nb;
-        while ((nb = netbuf_queue_pop(&dev->rx_queue)) != NULL)
-            dispatch_one(nb);
+        struct netbuf *pkts[NETDEV_BURST_MAX];
+        uint16_t n = netdev_rx_burst(netdev_get(i), 0, pkts, NETDEV_BURST_MAX);
+
+        for (uint16_t j = 0; j < n; ++j)
+            dispatch_one(pkts[j]);
     }
 
     // Transmit replies the workers handed back
     ip_tx_drain();
+
+    netdev_tx_defer_end();
 }
 
 // ── Core loops ─────────────────────────────────────────────────────────
@@ -171,10 +173,7 @@ NORETURN void dispatch_distributor_loop(int core_index)
 
     for (;;)
     {
-        // Poll the NIC
-        netdev_poll_all();
-
-        // Distribute queued packets to workers
+        // Poll the NICs and distribute packets to workers
         dispatch_rx();
 
         // Yield the pipeline - reduces power and bus contention
