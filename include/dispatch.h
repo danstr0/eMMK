@@ -134,12 +134,15 @@ NORETURN void dispatch_worker_loop(int core_index);
 /**
  * @brief Distribute one batch of received packets.
  *
- * Dequeues all packets from the default netdev's RX queue, hashes
- * each to a worker, and enqueues; then transmits the replies workers
- * handed back (@c ip_tx_drain()). Called internally by the distributor
- * loop; exposed for custom distributor implementations.
+ * Receives one burst from queue 0 of every netdev, hashes each IP packet
+ * to a worker and enqueues it (other freams are processed here); then
+ * transmits the replies workers handed back (@c ip_tx_drain()), all of
+ * it sharing one doorbell per device. Called internally by the
+ * distributor loop; exposed for custom distributor implementations.
+ *
+ * @return Packets received plus replies transmitted (0 = idle pass).
  */
-void dispatch_rx(void);
+uint32_t dispatch_rx(void);
 
 /// Get the SPSC ring for a worker (by worker index, 0-based).
 struct spsc_ring *dispatch_get_ring(int worker_index);
