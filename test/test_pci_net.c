@@ -3,8 +3,8 @@
  * @brief Tests for PCI enumeration, the driver model, MSI-X vector
  *        allocation, and virtio-net probing of every NIC.
  *
- * QEMU is started with one or two virtio-net devices
- * (`make test NICs=1|2`):
+ * QEMU is started with 1–16 virtio-net devices (`make test NICS=n`), NIC
+ * @e n on its own slirp network 10.0.(2+n).0/24
  * @code
  *   -device virtio-net-pci,netdev=net0 -netdev user,id=net0
  *   -device virtio-net-pci,netdev=net1 -netdev user,id=net1,net=10.0.3.0/24
@@ -22,6 +22,7 @@
 #include "io.h"
 #include "icmp.h"
 #include "timer.h"
+#include "smp.h"
 #include "format.h"
 
 // ── Test drivers ───────────────────────────────────────────────────────
@@ -73,12 +74,48 @@ static bool is_pow2(uint64_t x)
     return x != 0 && (x & (x - 1)) == 0;
 }
 
+static uint32_t test_ip(int nic)
+{
+#ifdef NET_TAP
+    if (nic == 0)
+        return IP4_ADDR(192, 168, 250, 2);
+#endif
+    return IP4_ADDR(10, 0, 2 + nic, 15);
+}
+
+static uint32_t test_gateway(int nic)
+{
+#ifdef NET_TAP
+    if (nic == 0)
+        return IP4_ADDR(192, 168, 250, 1);
+#endif
+    return IP4_ADDR(10, 0, 2 + nic, 2);
+}
+
 /// Send one echo request to each NIC's gateway.
 static void send_pings(int nics, uint16_t seq)
 {
     for (int i = 0; i < nics; ++i)
-        icmp_send_echo_request(IP4_ADDR(10, 0, 2 + i, 2),
-                               0x5b, seq, "5b", 2);
+        icmp_send_echo_request(test_gateway(i), 0x5b, seq, "5b", 2);
+}
+
+/// Vectors the NICs hold: one per MSI-X entry, one per shared INTx line.
+static int nic_vectors(void)
+{
+    int n = 0;
+    bool line_seen[16] = { false };
+    for (int i = 0; i < virtio_net_count(); ++i)
+    {
+        struct virtio_net_dev *dev = virtio_net_get(i);
+        if (dev->intx_line < 0)
+            n += dev->pci->msix_allocated;
+        else if (!line_seen[dev->intx_line])
+        {
+            line_seen[dev->intx_line] = true;
+            n++;
+        }
+    }
+    return n;
 }
 
 uint32_t test_pci_net(void)
@@ -95,7 +132,7 @@ uint32_t test_pci_net(void)
     TEST_ASSERT(bridge != NULL, "host bridge found");
 
     // ── Every virtio-net function was probed ────────────
-    // Transitional (QEMU's default) and modern-only
+    // Transitional (QEMU's default) and modern-only (disable-legacy=on)
     int nfound = 0, nmodern = 0;
     for (struct pci_device *p = NULL;
          (p = pci_find_device(PCI_VENDOR_VIRTIO,
@@ -162,8 +199,8 @@ uint32_t test_pci_net(void)
         if (!virtio_net_link_up(dev))
             link_ok = false;
 
-        if (!dev->rx_vq || !dev->tx_vq || dev->rx_vq->size == 0
-            || dev->tx_vq->size == 0)
+        if (!dev->q[0].rx_vq || !dev->q[0].tx_vq
+            || dev->q[0].rx_vq->size == 0 || dev->q[0].tx_vq->size == 0)
             queues_ok = false;
     
         // Its own netdev, named in probe order, carrying its MAC
@@ -189,26 +226,41 @@ uint32_t test_pci_net(void)
         }
         else
         {
-            if (pci->msix_allocated != 1
-                || pci->msix_vectors[0] != dev->irq_vector
-                || irq_vector_ctx(dev->irq_vector) != dev)
+            // One entry per pair, each with its own vector leading back
+            // to this device, aimed at the pair's core
+            if (dev->msix_entries == 0 || dev->msix_entries > dev->max_pairs
+                || pci->msix_allocated != dev->msix_entries
+                || pci->msix_vectors[0] != dev->irq_vector)
                 vector_ok = false;
+            for (uint16_t e = 0; e < pci->msix_allocated; ++e)
+                if (irq_vector_ctx(pci->msix_vectors[e]) != dev
+                    || pci->msix_table[e].msg_addr_lo
+                       != (0xFEE00000U | (smp_get_core(e)->apic_id << 12)))
+                    vector_ok = false;
 
-            // Both queues signal MSI-X entry 0
+            // Pair k: RX on entry k (mod entries), TX without a vector
+            // (its completions never wake anyone), both enabled; config
+            // changes raise nothing
             volatile uint8_t *c = vdev->common;
-            mmio_write16(c + VIRTIO_COMMON_Q_SELECT, VIRTIO_NET_RXQ);
-            uint16_t rxv = mmio_read16(c + VIRTIO_COMMON_Q_MSIX);
-            uint16_t rxe = mmio_read16(c + VIRTIO_COMMON_Q_ENABLE);
-            mmio_write16(c + VIRTIO_COMMON_Q_SELECT, VIRTIO_NET_TXQ);
-            uint16_t txv = mmio_read16(c + VIRTIO_COMMON_Q_MSIX);
-            uint16_t txe = mmio_read16(c + VIRTIO_COMMON_Q_ENABLE);
-            if (rxv != 0 || txv != 0 || rxe != 1 || txe != 1
-                || mmio_read16(c + VIRTIO_COMMON_MSIX) != VIRTIO_MSI_NO_VECTOR)
+            for (uint16_t k = 0; k < dev->max_pairs; ++k)
+            {
+                mmio_write16(c + VIRTIO_COMMON_Q_SELECT, 2 * k);
+                uint16_t rxv = mmio_read16(c + VIRTIO_COMMON_Q_MSIX);
+                uint16_t rxe = mmio_read16(c + VIRTIO_COMMON_Q_ENABLE);
+                mmio_write16(c + VIRTIO_COMMON_Q_SELECT, 2 * k + 1);
+                uint16_t txv = mmio_read16(c + VIRTIO_COMMON_Q_MSIX);
+                uint16_t txe = mmio_read16(c + VIRTIO_COMMON_Q_ENABLE);
+                if (rxv != k % dev->msix_entries
+                    || txv != VIRTIO_MSI_NO_VECTOR
+                    || rxe != 1 || txe != 1)
+                    vecreg_ok = false;
+            }
+            if (mmio_read16(c + VIRTIO_COMMON_MSIX) != VIRTIO_MSI_NO_VECTOR)
                 vecreg_ok = false;
         }
 
-        if (dev->netdev->stats.rx_packets != 0
-            || dev->netdev->stats.tx_packets != 0)
+        if (dev->netdev->qstats[0].rx_packets != 0
+            || dev->netdev->qstats[0].tx_packets != 0)
             stats_ok = false;
     }
     TEST_ASSERT(bound_ok, "each device bound");
@@ -217,7 +269,8 @@ uint32_t test_pci_net(void)
     TEST_ASSERT(queues_ok, "RX and TX queues created with descriptors");
     TEST_ASSERT(netdev_ok, "each device has its own netdev ethN");
     TEST_ASSERT(vector_ok, "each device has an allocated MSI-X vector");
-    TEST_ASSERT(vecreg_ok, "queues enabled on MSI-X entry 0");
+    TEST_ASSERT(vecreg_ok, "RX queues on their MSI-X entries, "
+                           "TX and config on none");
     TEST_ASSERT(regions_ok, "common/notify/ISR/device regions mapped");
     TEST_ASSERT(features_ok, "VERSION_1, MAC, and STATUS negotiated");
     TEST_ASSERT(status_ok, "status: FEATURES_OK and DRIVER_OK, no FAILED");
@@ -237,7 +290,7 @@ uint32_t test_pci_net(void)
         }
     TEST_ASSERT(distinct, "devices have distinct MACs, "
                           "vectors, and netdevs");
-    TEST_ASSERT_EQ(irq_vectors_free(), IRQ_DYN_COUNT - virtio_net_count(),
+    TEST_ASSERT_EQ(irq_vectors_free(), IRQ_DYN_COUNT - nic_vectors(),
                    "one vector allocated per device");
 
     struct virtio_net_dev *first = virtio_net_get(0);
@@ -336,7 +389,7 @@ uint32_t test_pci_net(void)
                    -1, "second pci_msix_alloc on a device fails");
     TEST_ASSERT_EQ(pci_msix_alloc(bridge, 1, virtio_net_irq_handler, NULL),
                    -1, "pci_msix_alloc without MSI-X fails");
-    TEST_ASSERT_EQ(irq_vectors_free(), IRQ_DYN_COUNT - virtio_net_count(),
+    TEST_ASSERT_EQ(irq_vectors_free(), IRQ_DYN_COUNT - nic_vectors(),
                    "failed allocations leak no vectors");
 
     // ── Driver registry ─────────────────────────────────
@@ -357,7 +410,7 @@ uint32_t test_pci_net(void)
         TEST_ASSERT_EQ(pci_register_driver(&drv_virtio_dup), -1,
                        "duplicate registration rejected");
         pci_unregister_driver(&drv_virtio_dup);
-    
+
         // A catch-all driver that declines is offered every unbound device
         int unbound = 0;
         for (int i = 0; i < count; ++i)
@@ -400,9 +453,9 @@ uint32_t test_pci_net(void)
         for (int i = 0; i < n; ++i)
         {
             struct virtio_net_dev *dev = virtio_net_get(i);
-            netdev_set_ip(dev->netdev, IP4_ADDR(10, 0, 2 + i, 15),
+            netdev_set_ip(dev->netdev, test_ip(i),
                           IP4_ADDR(255, 255, 255, 0),
-                          IP4_ADDR(10, 0, 2 + i, 2));
+                          test_gateway(i));
             irq_before[i] = dev->irq_count;
         }
 
@@ -424,7 +477,7 @@ uint32_t test_pci_net(void)
                                                NETDEV_BURST_MAX);
                 for (uint16_t j = 0; j < got; ++j)
                 {
-                    if (pkts[j]->pool != dev->rx_pool
+                    if (pkts[j]->pool != dev->q[0].rx_pool
                      || pkts[j]->dev != dev->netdev
                      || pkts[j]->data != pkts[j]->head)
                      zero_copy = false;
@@ -442,7 +495,7 @@ uint32_t test_pci_net(void)
         bool rx_ok = true, quiet = true;
         for (int i = 0; i < n; ++i)
         {
-            if (virtio_net_get(i)->netdev->stats.rx_packets == 0)
+            if (virtio_net_get(i)->netdev->qstats[0].rx_packets == 0)
                 rx_ok = false;
             if (virtio_net_get(i)->irq_count != irq_before[i])
                 quiet = false;
@@ -472,19 +525,59 @@ uint32_t test_pci_net(void)
 
         TEST_ASSERT(irqs_ok, "every NIC raised its own interrupt");
 
+        // Multiqueue: switch every pair on through the control queue,
+        // check the device still delivers, switch back.
+        bool mq_tested = false;
+        for (int i = 0; i < n; ++i)
+        {
+            struct virtio_net_dev *dev = virtio_net_get(i);
+            struct netdev *nd = dev->netdev;
+            if (dev->max_pairs < 2)
+                continue;
+            mq_tested = true;
+
+            TEST_ASSERT_EQ(netdev_set_queues(nd, dev->max_pairs), dev->max_pairs,
+                           "device accepts every queue pair (control queue)");
+            TEST_ASSERT_EQ(nd->num_queues, dev->max_pairs, "netdev uses them");
+            kprintf("  %s: %u pairs, %s\n", nd->name, nd->num_queues,
+                    dev->rss ? "device RSS" : "device steering");
+
+            icmp_get_stats(&s0);
+            icmp_send_echo_request(test_gateway(i), 0x5c, 1, "mq", 2);
+            deadline = timer_deadline_ms(3000);
+            do
+            {
+                for (uint16_t q = 0; q < nd->num_queues; ++q)
+                    netdev_poll_queue(nd, q);
+                icmp_get_stats(&s1);
+            } while (s1.rx_echo_reply == s0.rx_echo_reply
+                     && !timer_deadline_expired(deadline));
+            TEST_ASSERT_EQ(s1.rx_echo_reply - s0.rx_echo_reply, 1,
+                           "ping answered with every pair active");
+
+            TEST_ASSERT_EQ(netdev_set_queues(nd, 1), 1, "back to one pair");
+        }
+        if (!mq_tested)
+            kprintf("  no multiqueue NIC: pair switching skipped "
+                    "(make test NET=tap)\n");
+
         // Every buffer accounter for: on the ring, or free in the pool
         bool ring_full = true, no_leak = true;
         for (int i = 0; i < n; ++i)
         {
             struct virtio_net_dev *dev = virtio_net_get(i);
-            netdev_tx_burst(dev->netdev, 0, NULL, 0);
+            for (uint16_t k = 0; k < dev->max_pairs; ++k)
+            {
+                struct virtio_net_queue *q = &dev->q[k];
+                netdev_tx_burst(dev->netdev, k, NULL, 0);  // reclaim
 
-            uint32_t posted = dev->rx_vq->size - dev->rx_vq->num_free;
-            if (dev->rx_vq->num_free != 0)
-                ring_full = false;
-            if (netbuf_pool_available(dev->rx_pool) + posted
-                != dev->rx_pool->capacity)
-                no_leak = false;
+                uint32_t posted = q->rx_vq->size - q->rx_vq->num_free;
+                if (q->rx_vq->num_free != 0)
+                    ring_full = false;
+                if (netbuf_pool_available(q->rx_pool) + posted
+                    != q->rx_pool->capacity)
+                    no_leak = false;
+            }
         }
         TEST_ASSERT(ring_full, "RX ring refilled completely");
         TEST_ASSERT(no_leak, "no RX buffer leaked");
