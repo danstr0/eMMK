@@ -57,6 +57,10 @@ extern const uint8_t ETH_BROADCAST[ETH_ALEN];
 
 /// Zero address: @c 00:00:00:00:00:00 (unset / invalid).
 extern const uint8_t ETH_ZERO[ETH_ALEN];
+
+/// ARP frames dropped because they reached a core other than the TX
+/// owner (with RSS, non-IP frames all go to queue 0, which it polls).
+extern uint64_t eth_arp_misrouted;
 /// @}
 
 /// @name Ethernet header
@@ -112,6 +116,20 @@ void eth_input(struct netbuf *nb);
  * @note Always consumes @p nb regardless of success or failure.
  */
 int eth_output(struct netbuf *nb, const uint8_t *dest, uint16_t ethertype);
+
+/**
+ * @brief Send a reply back to the send of a received frame, in place.
+ *
+ * The received Ethernet header (@c nb->mac_header, just in front of
+ * @c nb->data) is rewritten: destination = the old source, source = the
+ * device's MAC. The frame leaves on the device and queue it came in on
+ * (@c nb->dev, @c nb->queue).
+ *
+ * @param nb  Netbuf with @c data at the network header of the reply.
+ * @return @c 0 on success, @c -1 on error.
+ * @note Always consumes @p nb.
+ */
+int eth_reflect(struct netbuf *nb);
 
 /**
  * @brief Construct an Ethernet header in-place.
