@@ -16,6 +16,9 @@
 const uint8_t ETH_BROADCAST[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 const uint8_t ETH_ZERO[ETH_ALEN]      = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
+/// ARP frames that reached a core other than the TX owner (dropped).
+uint64_t eth_arp_misrouted;
+
 // ── MAC address formatting ─────────────────────────────────────────────
 
 char *eth_addr_to_str(const uint8_t *addr, char *buf)
@@ -86,6 +89,15 @@ void eth_input(struct netbuf *nb)
     switch (ethertype)
     {
         case ETH_P_ARP:
+            // The ARP cache belongs to the TX owner (for now). With RSS,
+            // non-IP frames arrive on queue 0, which the owner polls;
+            // anything else is a misrouted frame and is dropped.
+            if (!ip_is_tx_owner())
+            {
+                __atomic_fetch_add(&eth_arp_misrouted, 1, __ATOMIC_RELAXED);
+                netbuf_free(nb);
+                break;
+            }
             arp_input(nb);
             break;
         case ETH_P_IP:
@@ -150,5 +162,33 @@ int eth_output(struct netbuf *nb, const uint8_t *dest, uint16_t ethertype)
 
     // Transmit via the network device
     return netdev_send(dev, nb);
+}
+
+int eth_reflect(struct netbuf *nb)
+{
+    struct ethhdr *eth = (struct ethhdr *)nb->mac_header;
+    struct netdev *dev = nb->dev;
+
+    // The Ethernet header is still in place just in front of the IP header
+    if (!netbuf_push(nb, ETH_HLEN) || (void *)nb->data != (void *)eth)
+    {
+        netbuf_free(nb);
+        return -1;
+    }
+
+    // Back to the sender, from us: no ARP lookup
+    eth_copy_addr(eth->dest, eth->src);
+    netdev_get_mac(dev, eth->src);
+
+    if (nb->len < ETH_FRAME_MIN)
+    {
+        size_t pad = ETH_FRAME_MIN - nb->len;
+        void *p = netbuf_put(nb, pad);
+        if (p)
+            memset(p, 0, pad);
+    }
+
+    // Same NIC, same queue it arrived on: owned by this core
+    return netdev_send_queue(dev, nb->queue, nb);
 }
 

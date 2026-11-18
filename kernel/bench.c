@@ -42,6 +42,11 @@ void bench_record(int core, uint64_t cycles)
         c->cycles_max = cycles;
 }
 
+void bench_record_busy(int core, uint64_t cycles)
+{
+    counters[core].busy_cycles += cycles;
+}
+
 // ── Reporting ──────────────────────────────────────────────────────────
 
 void bench_report(void)
@@ -51,12 +56,14 @@ void bench_report(void)
 
     uint64_t total_pps     = 0;
     uint64_t total_packets = 0;
+    uint64_t total_busy    = 0;
 
     kprintf("\n--- bench report ---\n");
 
     for (int i = 0; i < cores; ++i)
     {
         struct bench_counters *c = &counters[i];
+        total_busy += c->busy_cycles;
 
         if (c->packets == 0 && c->interval_packets == 0)
             continue;
@@ -96,8 +103,12 @@ void bench_report(void)
     }
 
     if (total_packets > 0)
+    {
         kprintf("  aggregate: %lu pps, %lu total\n",
                 total_pps, total_packets);
+        kprintf("  busy: %lu ns per packet (all cores)\n",
+                tsc_cycles_to_ns(total_busy / total_packets));
+    }
     else
         kprintf("  (no packets)\n");
 

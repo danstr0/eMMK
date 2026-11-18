@@ -60,6 +60,14 @@ void icmp_send_echo_reply(struct netbuf *nb)
     icmp->checksum = 0;
     icmp->checksum = icmp_checksum(icmp, nb->len);
 
+    // Straight back out of the queue it came in on
+    if (ip_can_reflect(nb))
+    {
+        if (ip_reflect(nb) == 0)
+            icmp_statistics.tx_echo_reply++;
+        return;
+    }
+
     // Clear the device so ip_output() does a fresh route lookup
     // This ensures the reply goes out the correct interface
     nb->dev = NULL;

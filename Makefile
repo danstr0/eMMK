@@ -70,7 +70,38 @@ comma := ,
 qemu_nic = -device virtio-net-pci,netdev=net$(1)$(NIC_OPTS) \
            -netdev user,id=net$(1),net=10.0.$(shell echo $$((2 + $(1)))).0/24$(if $(filter 0,$(1)),$(comma)hostfwd=udp::8080-:7)
 
-QEMU_NET  := $(foreach n,$(shell seq 0 $$(($(NICS) - 1))),$(call qemu_nic,$(n)))
+## NET=tap: NIC 0 is on the host's multi-queue tap device instead of
+## slirp (create it once per WSL boot with tools/tap_setup.sh). The kernel
+## then uses 192.168.250.2, the host 192.168.250.1. QUEUES=n (default 4)
+## queue pairs, with device RSS (rss=on) and one MSI-X vector per queue.
+## Any further NICs stay on slirp.
+NET    ?= user
+QUEUES ?= 4
+TAP    ?= emmk0
+ifeq ($(NET),tap)
+QEMU_NET := -netdev tap,id=net0,ifname=$(TAP),script=no,downscript=no,queues=$(QUEUES) \
+            -device virtio-net-pci,netdev=net0,mq=on,rss=on,vectors=$(shell echo $$((2 * $(QUEUES) + 2)))$(NIC_OPTS)
+ifneq ($(NICS),1)
+QEMU_NET += $(foreach n,$(shell seq 1 $$(($(NICS) - 1))),$(call qemu_nic,$(n)))
+endif
+else ifeq ($(NET),user)
+QEMU_NET := $(foreach n,$(shell seq 0 $$(($(NICS) - 1))),$(call qemu_nic,$(n)))
+else
+$(error NET must be user or tap (got '$(NET)'))
+endif
+
+## DEMO=rss: `make demo` runs share-nothing (core k owns queue k of every
+## NIC; best with NET=tap) instead of the distributor + workers pipeline.
+DEMO ?= dist
+ifeq ($(filter $(DEMO),dist rss),)
+$(error DEMO must be dist or rss (got '$(DEMO)'))
+endif
+
+## Compile-time switches for kernel/main.c and the tests. A stamp file per
+## combination makes switching NET / DEMO rebuild what depends on them.
+KDEFS := $(if $(filter tap,$(NET)),-DNET_TAP) $(if $(filter rss,$(DEMO)),-DDEMO_RSS)
+CONFIG_STAMP := build/.config-$(NET)-$(DEMO)
+
 QEMU_TEST := -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot
 
 ## KVM=1 -> hardware virtualization with the host CPU model
@@ -132,7 +163,7 @@ clean:
 
 build/kernel.bin: $(ASM_OBJ) build/kernel/main.o $(KERN_OBJ)
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS) -o $@ $^
+	$(LD) $(LDFLAGS) -o $@ $(filter %.o,$^)
 
 build/os.iso: build/kernel.bin grub.cfg
 	@mkdir -p build/iso/boot/grub
@@ -144,7 +175,7 @@ build/os.iso: build/kernel.bin grub.cfg
 
 build/test-kernel.bin: $(ASM_OBJ) build/test/main.o $(KERN_OBJ) $(TEST_OBJ)
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS) -o $@ $^
+	$(LD) $(LDFLAGS) -o $@ $(filter %.o,$^)
 
 build/test.iso: build/test-kernel.bin grub.cfg
 	@mkdir -p build/test-iso/boot/grub
@@ -156,7 +187,7 @@ build/test.iso: build/test-kernel.bin grub.cfg
 
 build/demo-kernel.bin: $(ASM_OBJ) build/demo/main.o $(KERN_OBJ)
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS) -o $@ $^
+	$(LD) $(LDFLAGS) -o $@ $(filter %.o,$^)
 
 build/demo.iso: build/demo-kernel.bin grub.cfg
 	@mkdir -p build/demo-iso/boot/grub
@@ -201,20 +232,32 @@ build/net/%.o: net/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-## C - main.c recompiled with KERNEL_TEST
-build/test/main.o: kernel/main.c
+## NET / DEMO stamp: (re)created when the combination changes, so the
+## objects below that see $(KDEFS) are rebuilt
+$(CONFIG_STAMP):
+	@mkdir -p build
+	@rm -f build/.config-* 
+	@touch $@
+
+## C - main.c, default kernel
+build/kernel/main.o: kernel/main.c $(CONFIG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -DKERNEL_TEST -c $< -o $@
+	$(CC) $(CFLAGS) $(KDEFS) -c $< -o $@
+
+## C - main.c recompiled with KERNEL_TEST
+build/test/main.o: kernel/main.c $(CONFIG_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(KDEFS) -DKERNEL_TEST -c $< -o $@
 
 ## C - test sources
-build/test/%.o: test/%.c
+build/test/%.o: test/%.c $(CONFIG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -DKERNEL_TEST -c $< -o $@
+	$(CC) $(CFLAGS) $(KDEFS) -DKERNEL_TEST -c $< -o $@
 
 ## C - main.c recompiled with KERNEL_DEMO
-build/demo/main.o: kernel/main.c
+build/demo/main.o: kernel/main.c $(CONFIG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -DKERNEL_DEMO -c $< -o $@
+	$(CC) $(CFLAGS) $(KDEFS) -DKERNEL_DEMO -c $< -o $@
 
 # ── Auto-generated header dependencies ──────────────────────────────────
 

@@ -198,7 +198,7 @@ struct virtio_buf
 /// @{
 
 /// Maximum number of virtqueues per device.
-#define VIRTIO_MAX_QUEUES  8
+#define VIRTIO_MAX_QUEUES  64
 
 /**
  * @brief Common state for any virtio PCI device (modern transport).

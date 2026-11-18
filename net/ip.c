@@ -29,6 +29,13 @@ static struct spsc_ring *ip_tx_rings[SMP_MAX_CORES];
 /// Per-core count of packets dropped on a full handoff ring.
 static uint64_t ip_tx_drops[SMP_MAX_CORES];
 
+/// Per-core count of packets handed to the TX owner (one line per core:
+/// only the owning core writes its counter).
+static struct { uint64_t n; } ALIGNED(64) ip_tx_handoffs[SMP_MAX_CORES];
+
+/// Replies to received packets are reflected on their RX queue.
+static bool ip_reflect_mode = false;
+
 static int ip_output_finish(struct netbuf *nb);
 
 // ── Initialization ─────────────────────────────────────────────────────
@@ -138,7 +145,7 @@ int ip_route(uint32_t dst_ip, struct netdev **dev, uint32_t *next_hop)
     // Limited broadcast: out the first device
     if (dst_ip == 0xFFFFFFFF && first)
     {
-        *dev = first;
+        *dev      = first;
         *next_hop = dst_ip;
         return 0;
     }
@@ -146,7 +153,7 @@ int ip_route(uint32_t dst_ip, struct netdev **dev, uint32_t *next_hop)
     // Off-link: the first default gateway
     if (gateway)
     {
-        *dev = gateway;
+        *dev      = gateway;
         *next_hop = gateway->gateway;
         return 0;
     }
@@ -307,6 +314,7 @@ int ip_output(struct netbuf *nb, uint32_t dst_ip, uint8_t protocol)
             netbuf_free(nb);
             return -1;
         }
+        ip_tx_handoffs[me].n++;
         return 0;
     }
 
@@ -394,6 +402,70 @@ uint64_t ip_tx_handoff_drops(void)
     for (int i = 0; i < SMP_MAX_CORES; ++i)
         n += ip_tx_drops[i];
     return n;
+}
+
+uint64_t ip_tx_handoff_count(void)
+{
+    uint64_t n = 0;
+    for (int i = 0; i < SMP_MAX_CORES; ++i)
+        n += ip_tx_handoffs[i].n;
+    return n;
+}
+
+int ip_tx_owner_core(void)
+{
+    return ip_tx_owner;
+}
+
+bool ip_is_tx_owner(void)
+{
+    int owner = ip_tx_owner;
+    return owner < 0 || owner == smp_core_id();
+}
+
+// ── Reflected replies ──────────────────────────────────────────────────
+
+void ip_set_reflect(bool enable)
+{
+    ip_reflect_mode = enable;
+    if (enable)
+        kprintf("[IP] Replies are reflected on their RX queue\n");
+}
+
+bool ip_can_reflect(const struct netbuf *nb)
+{
+    if (!ip_reflect_mode || !nb->dev || !nb->mac_header || !nb->network_header)
+        return false;
+
+    // Only a unicast exchange with a real sender, addressed to us
+    return nb->pkt_type == PKT_HOST
+        && nb->src_ip != 0 && nb->src_ip != 0xFFFFFFFF
+        && !ip_is_broadcast(nb->src_ip, nb->dev)
+        && nb->dst_ip == nb->dev->ip_addr;
+}
+
+int ip_reflect(struct netbuf *nb)
+{
+    struct iphdr *ip = (struct iphdr *)nb->network_header;
+    size_t hdr_len = (size_t)ip->ihl * 4;
+
+    // The IP header is still in place just in front of the L4 data
+    if (!netbuf_push(nb, hdr_len) || (void *)nb->data != (void *)ip)
+    {
+        netbuf_free(nb);
+        return -1;
+    }
+
+    uint32_t peer = ip->saddr;
+    ip->saddr    = ip->daddr;
+    ip->daddr    = peer;
+    ip->tot_len  = htons(nb->len);
+    ip->ttl      = IP_DEFAULT_TTL;
+    ip->frag_off = htons(IP_FLAG_DF);
+    ip->check    = 0;
+    ip->check    = ip_checksum(ip, hdr_len);
+
+    return eth_reflect(nb);
 }
 
 int ip_output_resolved(struct netbuf *nb, const uint8_t *dst_mac)

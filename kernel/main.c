@@ -10,8 +10,9 @@
  * @par Build modes
  * - Default: single-core poll loop
  * - @c KERNEL_TEST: test runner (see test/test_main.c)
- * - @c KERNEL_DEMO: multi-core distributed pipeline with UDP echo
- *   server and per-core benchmarking.
+ * - @c KERNEL_DEMO: multi-core UDP echo server with per-core
+ *   benchmarking: a distributor + workers pipeline (software RSS), or
+ *   with @c DEMO_RSS share-nothing (core k owns queue k; device RSS).
  */
 
 #include "types.h"
@@ -90,12 +91,32 @@ static void print_memory_map(struct multiboot2_tag_mmap *mmap)
 
 // ── Network configuration ──────────────────────────────────────────────
 
-/// Give every virtio-net device its IPv4 address.
+/**
+ * @brief Give every virtio-net device its IPv4 address.
+ *
+ * QEMU user-mode networking (slirp): NIC @e n is on its own
+ * `-netdev user,net=10.0.(2+n).0/24`, so it gets @c 10.0.(2+n).15 with
+ * gateway @c 10.0.(2+n).2. Distinct subnets keep connected-subnet routing
+ * unambiguous.
+ *
+ * @c NET_TAP (make NET=tap): one NIC on the host's tap device,
+ * 192.168.250.2/24, the host being .1.
+ */
 static void net_configure(void)
 {
     for (int i = 0; i < virtio_net_count(); ++i)
     {
         struct netdev *dev = virtio_net_get(i)->netdev;
+#ifdef NET_TAP
+        if (i == 0)
+        {
+            netdev_set_ip(dev,
+                          IP4_ADDR(192, 168, 250, 2),
+                          IP4_ADDR(255, 255, 255, 0),
+                          IP4_ADDR(192, 168, 250, 1));
+            continue;
+        }
+#endif
         netdev_set_ip(dev,
                       IP4_ADDR(10, 0, 2 + i, 15),
                       IP4_ADDR(255, 255, 255, 0),
@@ -142,55 +163,123 @@ static NORETURN void bench_worker_loop(int core_index)
             eth_input(nb);
             uint64_t t1 = tsc_read();
             bench_record(core_index, t1 - t0);
+            bench_record_busy(core_index, t1 - t0);
         }
         __asm__ volatile("pause");
     }
 }
 
-/// Report the buffer counters: with zero-copy echo, packets flow through
-/// the pools while slow_allocs stays flat.
+/// Report the buffer and cross-core counters. With zero-copy echo,
+/// packets flow through the pools while slow_allocs stays flat; in
+/// share-nothing mode, nothing crosses cores.
 static void demo_report_buffers(void)
 {
     uint64_t pool_allocs = 0, remote_frees = 0, fails = 0;
 
     for (int i = 0; i < virtio_net_count(); ++i)
     {
-        struct netbuf_pool *pool = virtio_net_get(i)->rx_pool;
-        pool_allocs  += pool->allocs;
-        remote_frees += pool->remote_frees;
-        fails        += pool->alloc_fails;
+        struct virtio_net_dev *vnet = virtio_net_get(i);
+        for (int k = 0; k < vnet->max_pairs; ++k)
+        {
+            struct netbuf_pool *pool = vnet->q[k].rx_pool;
+            pool_allocs  += pool->allocs;
+            remote_frees += pool->remote_frees;
+            fails        += pool->alloc_fails;
+        }
     }
 
     kprintf("[NETBUF] slow_allocs=%lu pool_allocs=%lu remote_frees=%lu "
             "pool_empty=%lu\n", netbuf_slow_allocs(), pool_allocs,
             remote_frees, fails);
+    kprintf("[DEMO] cross-core: handoffs=%lu remote_frees=%lu "
+            "arp_misrouted=%lu\n", ip_tx_handoff_count(), remote_frees,
+            __atomic_load_n(&eth_arp_misrouted, __ATOMIC_RELAXED));
+}
+
+/// Print the reports every ~5 seconds (called by core 0 only).
+static void demo_maybe_report(uint64_t *next_report)
+{
+    uint64_t now = tsc_read();
+    if (now >= *next_report)
+    {
+        bench_report();
+        demo_report_buffers();
+        *next_report = now + tsc_get_freq() * 5;
+    }
 }
 
 /// Distributor loop with periodic benchmark reporting.
 static NORETURN void bench_distributor_loop(int core_index)
 {
-    (void)core_index;
-
     kprintf("[DEMO] Distributor running on core %d\n", core_index);
 
     uint64_t next_report = tsc_read() + tsc_get_freq() * 5;
 
     for (;;)
     {
-        dispatch_rx();
+        uint64_t t0 = tsc_read();
+        if (dispatch_rx() > 0)
+            bench_record_busy(core_index, tsc_read() - t0);
 
-        // Report every ~5 seconds
-        uint64_t now = tsc_read();
-        if (now >= next_report)
-        {
-            bench_report();
-            demo_report_buffers();
-            next_report = now + tsc_get_freq() * 5;
-        }
-
+        demo_maybe_report(&next_report);
         __asm__ volatile("pause");
     }
 }
+
+#ifdef DEMO_RSS
+
+/**
+ * @brief Share-nothing core loop: core @p core owns queue @p core of
+ *        every NIC.
+ *
+ * It polls only its own queues, runs every packet through the stack to
+ * completion, and transmits replies on the queue they arrived on. Nothing
+ * is handed to another core on this path. Core 0, the TX owner, also owns
+ * ARP and sets what other cores hand it (slow path only).
+ */
+static NORETURN void rss_core_loop(int core)
+{
+    kprintf("[DEMO] Share-nothing core %d polling queue %d\n", core, core);
+
+    uint64_t next_report = tsc_read() + tsc_get_freq() * 5;
+
+    for (;;)
+    {
+        uint64_t t0 = tsc_read();
+        uint32_t work = 0;
+
+        netdev_tx_defer_begin();
+        for (int i = 0; i < netdev_count(); ++i)
+        {
+            struct netdev *dev = netdev_get(i);
+            if (core >= dev->num_queues)
+                continue;
+
+            struct netbuf *pkts[NETDEV_BURST_MAX];
+            uint16_t n = netdev_rx_burst(dev, (uint16_t)core, pkts,
+                                         NETDEV_BURST_MAX);
+            for (uint16_t j = 0; j < n; ++j)
+            {
+                uint64_t p0 = tsc_read();
+                eth_input(pkts[j]);
+                bench_record(core, tsc_read() - p0);
+            }
+            work += n;
+        }
+        if (core == 0)
+            work += (uint32_t)ip_tx_drain();
+        netdev_tx_defer_end();
+
+        if (work > 0)
+            bench_record_busy(core, tsc_read() - t0);
+
+        if (core == 0)
+            demo_maybe_report(&next_report);
+        __asm__ volatile("pause");
+    }
+}
+
+#endif // DEMO_RSS
 
 #endif // KERNEL_DEMO
 
@@ -348,6 +437,33 @@ NORETURN void kernel_main(struct multiboot2_info *mb_info)
 
     // Initialize benchmarking
     bench_init();
+
+#ifdef DEMO_RSS
+    // ── Share-nothing: core k owns queue k of every NIC ──
+    int used = 1;
+    for (int i = 0; i < netdev_count(); ++i)
+    {
+        int n = netdev_set_queues(netdev_get(i), (uint16_t)cores);
+        if (n > used)
+            used = n;
+    }
+
+    // Core 0 owns ARP and the general TX path; replies to received
+    // packets leave on the queue they came in on
+    ip_set_tx_owner(0);
+    ip_set_reflect(true);
+    udp_bind(ECHO_PORT, udp_echo_handler);
+
+    kprintf("\n[DEMO] UDP echo server on port %d (share-nothing)\n", ECHO_PORT);
+    kprintf("[DEMO] %d core(s) with a queue, of %d\n", used, cores);
+    kprintf("[DEMO] Reporting every 5 seconds\n\n");
+
+    for (int i = 1; i < used; ++i)
+        smp_assign_role(i, rss_core_loop, "queue owner");
+    smp_launch_all();
+
+    rss_core_loop(0);
+#endif
 
     // Configure worker cores
     int worker_ids[DISPATCH_MAX_WORKERS];

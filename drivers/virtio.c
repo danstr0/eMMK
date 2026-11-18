@@ -257,6 +257,10 @@ int virtio_negotiate_features(struct virtio_device *vdev, uint64_t desired)
 
     vdev->features = negotiated;
 
+    // The queue count can depend on the features (QEMU's virtio-net adds
+    // the extra pairs and the control queue only once MQ is negotiated)
+    vdev->max_queues = common_read16(vdev, VIRTIO_COMMON_NUMQ);
+
     kprintf("[VIRTIO] Features: offered=0x%lx, desired=0x%lx, "
             "negotiated=0x%lx\n", offered, desired, negotiated);
 

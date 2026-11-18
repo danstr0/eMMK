@@ -3,12 +3,13 @@
  * @brief Virtio network device driver interface.
  *
  * Drives virtio-net devices (transitional or modern-only) through the
- * virtio 1.x PCI transport. Uses two virtqueues for data transfer:
- * - Queue 0 (RX): device writes received packets (pre-filled with
- *   buffers by the driver).
- * - Queue 1 (TX): driver writes packets to send.
- * - Queue 2 (Control): optional, for MAC filtering, VLAN, etc.
- *   (not used by this driver).
+ * virtio 1.x PCI transport. Data moves through queue pairs:
+ * - Queue 2k (RX of pair k): device writes received packets
+ *   (pre-filled with buffers by the driver).
+ * - Queue 2k+1 (TX of pair k): driver writes packets to send.
+ * - Control queue, after every pair the device supports: switches pairs
+ *   on and programs RSS.
+ * Pair k belongs to core k.
  *
  * @par Packet format
  * Every packet on the virtqueues is prefixed with a @c virtio_net_hdr
@@ -70,9 +71,35 @@ struct netdev;
 
 /// @name Device configuration offsets
 /// @{
-#define VIRTIO_NET_CFG_MAC     0  ///< 6 bytes: MAC address.
-#define VIRTIO_NET_CFG_STATUS  6  ///< 16: @c VIRTIO_NET_S_*.
+#define VIRTIO_NET_CFG_MAC              0  ///< 6 bytes: MAC address.
+#define VIRTIO_NET_CFG_STATUS           6  ///< 16: @c VIRTIO_NET_S_*.
+#define VIRTIO_NET_CFG_MAX_VQ_PAIRS     8  ///< 16: queue pairs (with MQ or RSS).
+#define VIRTIO_NET_CFG_RSS_MAX_KEY     17  ///< 8:  largest RSS key (with RSS).
+#define VIRTIO_NET_CFG_RSS_MAX_TABLE   18  ///< 16: largest indirection table.
+#define VIRTIO_NET_CFG_RSS_HASH_TYPES  20  ///< 32: supported hash types.
 /// @}
+
+/// @name Control virtqueue
+/// @{
+#define VIRTIO_NET_CTRL_MQ               4  ///< Class: multiqueue.
+#define VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET  0  ///< Use N pairs (device steers).
+#define VIRTIO_NET_CTRL_MQ_RSS_CONFIG    1  ///< RSS key, table, hash types.
+#define VIRTIO_NET_OK                    0  ///< Command acknowledged.
+
+// RSS hash types (hash_types, supported_hash_types)
+#define VIRTIO_NET_RSS_HASH_TYPE_IPv4   (1U << 0)
+#define VIRTIO_NET_RSS_HASH_TYPE_TCPv4  (1U << 1)
+#define VIRTIO_NET_RSS_HASH_TYPE_UDPv4  (1U << 2)
+
+/// Indirection table entries the driver programs (power of 2).
+#define VIRTIO_NET_RSS_TABLE_LEN  128
+
+/// Length of the Toeplitz key the driver programs.
+#define VIRTIO_NET_RSS_KEY_LEN     40
+/// @}
+
+/// Queue pairs the driver sets up per device.
+#define VIRTIO_NET_MAX_PAIRS  8
 
 /// @name Virtio-net header
 /// @{
@@ -148,14 +175,32 @@ _Static_assert(NETBUF_DATA_SIZE >= 1514,
 /// @}
 
 /// @name Virtqueue indices
+///
+/// Pair @e k uses virtqueues 2k (RX) and 2k+1 (TX); the control queue
+/// follows every pair the device supports: `2 × max_virtqueue_pairs`
+/// (2 without multiqueue).
 /// @{
-#define VIRTIO_NET_RXQ  0  ///< Receive queue.
-#define VIRTIO_NET_TXQ  1  ///< Transmit queue.
-#define VIRTIO_NET_CTQ  2  ///< Control queue (optional, unused).
+#define VIRTIO_NET_RXQ  0  ///< Receive queue of pair 0.
+#define VIRTIO_NET_TXQ  1  ///< Transmit queue of pair 0.
 /// @}
 
 /// @name Device structure
 /// @{
+
+/**
+ * @brief One RX/TX queue pair, used by one core.
+ *
+ * Pair @e k belongs to core @e k: only that core polls it, transmits on
+ * it, and allocates from its pool. Cache-line aligned, so two cores'
+ * pairs never share a line.
+ */
+struct virtio_net_queue
+{
+    struct virtqueue   *rx_vq;       ///< Receive virtqueue.
+    struct virtqueue   *tx_vq;       ///< Transmit virtqueue.
+    struct netbuf_pool *rx_pool;     ///< This pair's RX buffers (owner: core @e k).
+    uint64_t            rx_dropped;  ///< Frames dropped by the driver.
+} ALIGNED(64);
 
 /// State for a single virtio-net device.
 struct virtio_net_dev
@@ -167,23 +212,36 @@ struct virtio_net_dev
 
     uint8_t mac[6];                ///< MAC address.
 
-    /// IDT vector that wakes the core for this device (0 = none).
-    uint8_t irq_vector;
+    /// IDT vector of pair 0's RX interrupt (0 = none). Pair @e k uses
+    /// `pci->msix_vectors[k % msix_entries]`.
+    uint8_t  irq_vector;
+
+    /// MSI-X entries in use (one per pair, as far as the table allows).
+    uint16_t msix_entries;
 
     /// PCI INTx line in use, or @c -1 (MSI-X or no interrupt).
-    int     intx_line;
+    int      intx_line;
 
     /// Interrupts acknowledged for this device
     volatile uint64_t irq_count;
 
-    struct virtqueue *rx_vq;      ///< Receive virtqueue.
-    struct virtqueue *tx_vq;      ///< Transmit virtqueue.
+    /// @name Queue pairs
+    /// @{
+    uint16_t max_pairs;       ///< Pairs set up (≤ device, cores, @c VIRTIO_NET_MAX_PAIRS).
+    uint16_t active_pairs;    ///< Pairs the device currently delivers to.
+    bool     rss;             ///< Device RSS negotiated (else MQ steering).
+    uint8_t  rss_key_len;     ///< RSS key length used.
+    uint16_t rss_table_len;   ///< RSS indirection table length used.
+    uint32_t rss_hash_types;  ///< Hash types enabled.
+    struct virtio_net_queue q[VIRTIO_NET_MAX_PAIRS];
+    /// @}
 
-    struct netbuf_pool *rx_pool;  ///< The RX queue's buffers.
-
-    /// Frames the device delivered that the driver had to drop. Packet
-    /// and byte counters reside in the netdev.
-    uint64_t rx_dropped;
+    /// @name Control virtqueue
+    /// @{
+    struct virtqueue *ctrl_vq;  ///< Control queue, or @c NULL.
+    uint8_t *ctrl_buf;          ///< Command page (header, data, ack).
+    uint64_t ctrl_phys;         ///< Its physical address.
+    /// @}
 };
 /// @}
 

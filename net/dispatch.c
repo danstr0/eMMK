@@ -143,8 +143,10 @@ static void dispatch_one(struct netbuf *nb)
 
 // ── Batch distribution ─────────────────────────────────────────────────
 
-void dispatch_rx(void)
+uint32_t dispatch_rx(void)
 {
+    uint32_t work = 0;
+
     // Everything sent below shares one doorbell per device
     netdev_tx_defer_begin();
 
@@ -155,12 +157,14 @@ void dispatch_rx(void)
 
         for (uint16_t j = 0; j < n; ++j)
             dispatch_one(pkts[j]);
+        work += n;
     }
 
     // Transmit replies the workers handed back
-    ip_tx_drain();
+    work += (uint32_t)ip_tx_drain();
 
     netdev_tx_defer_end();
+    return work;
 }
 
 // ── Core loops ─────────────────────────────────────────────────────────

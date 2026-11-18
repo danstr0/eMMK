@@ -47,10 +47,13 @@
 /// @{
 
 /// Maximum number of registered network devices.
-#define NETDEV_MAX  16
+#define NETDEV_MAX         16
 
 /// Largest burst handled at once (and TX packets held back per device).
-#define NETDEV_BURST_MAX  32
+#define NETDEV_BURST_MAX   32
+
+/// Maximum hardware RX/TX queue pairs per device (one per core).
+#define NETDEV_MAX_QUEUES  16
 /// @}
 
 /// @name Device flags
@@ -64,6 +67,8 @@
 
 /// @name Statistics
 /// @{
+
+/// Device totals (summed over the queues by @c netdev_get_stats()).
 struct netdev_stats
 {
     uint64_t rx_packets;
@@ -75,6 +80,20 @@ struct netdev_stats
     uint64_t rx_dropped;
     uint64_t tx_dropped;
 };
+
+/**
+ * @brief Counters of one queue pair, written only by the core that owns it.
+ *
+ * One cache line each: cores polling their own queues never share one.
+ */
+struct netdev_queue_stats
+{
+    uint64_t rx_packets;
+    uint64_t rx_bytes;
+    uint64_t tx_packets;
+    uint64_t tx_bytes;
+    uint64_t tx_dropped;
+} ALIGNED(64);
 /// @}
 
 /// @name Device operations
@@ -123,6 +142,13 @@ struct netdev_ops
      */
     void (*rx_irq)(struct netdev *dev, uint16_t qid, bool enable);
 
+    /**
+     * Use @p n queue pairs (spreading received flows over them where the
+     * device can). Queue @e k is meant for core @e k.
+     * @return The number of pairs now in use (≤ @c max_queues).
+     */
+    uint16_t (*set_queues)(struct netdev *dev, uint16_t n);
+
     /// Set the device's MAC address.
     int  (*set_mac)(struct netdev *dev, const uint8_t *mac);
 };
@@ -143,20 +169,16 @@ struct netdev
     uint32_t gateway;  ///< Default gateway (host byte order).
     /// @}
 
-    struct netdev_stats stats;
-
     /// @name Driver interface
     /// @{
     const struct netdev_ops *ops;  ///< Device operations.
     void *priv;                    ///< Driver-private data.
-    uint16_t num_queues;           ///< Hardware RX/TX queue pairs.
+    uint16_t num_queues;           ///< Queue pairs in use (0..`num_queues - 1`).
+    uint16_t max_queues;           ///< Queue pairs the driver set up.
     /// @}
 
-    /// @name Held-back transmissions (see @c netdev_tx_defer_begin())
-    /// @{
-    uint16_t tx_held;                          ///< Packets in @c tx_hold.
-    struct netbuf *tx_hold[NETDEV_BURST_MAX];  ///< Packets not yet posted.
-    /// @}
+    /// Per-queue counters.
+    struct netdev_queue_stats qstats[NETDEV_MAX_QUEUES];
 };
 
 /// @name Initialization
@@ -246,11 +268,9 @@ uint16_t netdev_tx_burst(struct netdev *dev, uint16_t qid,
 /**
  * @brief Transmit a packet through a device (stack entry point).
  *
- * Always consumes @p nb regardless of success or failure (freed on
- * error, owned by the driver on success). Inside a
- * @c netdev_tx_defer_begin() section the packet is held back and posted
- * with the rest of the burst; a later failure is then counted in
- * @c tx_dropped, and @c 0 has been returned.
+ * Sends on queue 0: the stack's general transmit path belongs to the TX
+ * owner (see @c ip_set_tx_owner()), which owns queue 0 of every device.
+ * Equivalent to `netdev_send_queue(dev, 0, nb)`.
  *
  * @param dev  Network device.
  * @param nb   Network buffer.
@@ -259,14 +279,28 @@ uint16_t netdev_tx_burst(struct netdev *dev, uint16_t qid,
 int netdev_send(struct netdev *dev, struct netbuf *nb);
 
 /**
- * @brief Start holding back @c netdev_send() on every device.
+ * @brief Transmit a packet on a given queue (the caller must own it).
  *
- * Lets a burst of replies share one doorbell per device. Only the TX
- * owner may use it. @c netdev_tx_defer_end() posts what is held.
+ * Always consumes @p nb regardless of success or failure (freed on error,
+ * owned by the driver on success). Inside a @c netdev_tx_defer_begin()
+ * section on this core the packet is held back and posted with the rest
+ * of the burst; a later failure is then counted in @c tx_dropped, and
+ * @c 0 has been returned.
+ *
+ * @return @c 0 on success, @c -1 on failure.
+ */
+int netdev_send_queue(struct netdev *dev, uint16_t qid, struct netbuf *nb);
+
+/**
+ * @brief Start holding back transmissions made on this core.
+ *
+ * Lets a burst of replies share one doorbell per device. Per core: each
+ * core holds back only what it sends itself, on its own queues. No
+ * nesting. @c netdev_tx_defer_end() posts what is held.
  */
 void netdev_tx_defer_begin(void);
 
-/// Stop holding back, and post everything held on every device.
+/// Stop holding back on this core, and post everything it held.
 void netdev_tx_defer_end(void);
 
 /**
@@ -276,10 +310,30 @@ void netdev_tx_defer_end(void);
 uint16_t netdev_poll(struct netdev *dev);
 
 /**
- * @brief Poll every device, with replies batched per device.
+ * @brief Receive one burst from queue @p qid (the caller must own it)
+ *        and run it through the stack.
+ * @return Number of packets processed.
+ */
+uint16_t netdev_poll_queue(struct netdev *dev, uint16_t qid);
+
+/**
+ * @brief Poll queue 0 of every device, with replies batched per device.
  * @return Number of packets processed.
  */
 uint32_t netdev_poll_all(void);
+
+/**
+ * @brief Use @p n queue pairs on @p dev (where the driver supports it).
+ *
+ * Queue @e k is meant to be polled by core @e k only. Call before the
+ * cores start polling.
+ *
+ * @return The number of pairs now in use (1 if the device has one queue).
+ */
+uint16_t netdev_set_queues(struct netdev *dev, uint16_t n);
+
+/// Sum the per-queue counters of @p dev into @p out.
+void netdev_get_stats(struct netdev *dev, struct netdev_stats *out);
 
 /**
  * @brief Allow or suppress RX interrupts on every device.

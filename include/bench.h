@@ -49,6 +49,10 @@ struct bench_counters
     // Interval tracking
     uint64_t interval_packets;  ///< Packets since last report.
     uint64_t interval_start;    ///< TSC at start of current interval.
+
+    /// Cycles this core spent in loop iterations that did work (polling,
+    /// distributing, processing, transmitting).
+    uint64_t busy_cycles;
 } ALIGNED(64);
 /// @}
 
@@ -72,6 +76,19 @@ void bench_init(void);
  * @param cycles  TSC cycles spent processing this packet.
  */
 void bench_record(int core, uint64_t cycles);
+
+/**
+ * @brief Record time a core spent in a loop iteration that did work.
+ *
+ * Unlike @c bench_record(), which times one stage per packet, this
+ * covers everything a core does for the data path. The report divides
+ * the sum over all cores by the packets processed, giving the total CPU
+ * cost of one packet.
+ *
+ * @param core    Core index (the caller's own).
+ * @param cycles  TSC cycles of the iteration.
+ */
+void bench_record_busy(int core, uint64_t cycles);
 /// @}
 
 /// @name Reporting
