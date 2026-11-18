@@ -177,6 +177,46 @@ size_t ip_tx_pending(void);
 /// @return Packets dropped because a handoff ring was full.
 uint64_t ip_tx_handoff_drops(void);
 
+/// @return Packets handed to the TX owner so far (cross-core traffic).
+uint64_t ip_tx_handoff_count(void);
+
+/// @return The TX owner core, or @c -1 if every core transmits itself.
+int ip_tx_owner_core(void);
+
+/// @return @c true if the calling core may use the shared TX path and
+///         the ARP cache (it is the owner, or there is none).
+bool ip_is_tx_owner(void);
+/// @}
+
+/// @name Reflected replies (share-nothing)
+/// @{
+
+/// Reflect replies (@c udp_reply(), ICMP echo) where possible.
+void ip_set_reflect(bool enable);
+
+/**
+ * @brief Whether a reply to @p nb can be reflected.
+ *
+ * Requires reflect mode, a unicast packet addressed to the receiving
+ * device, from a real (non-broadcast) sender, with its Ethernet and IP
+ * headers still in place (@c mac_header, @c network_header).
+ */
+bool ip_can_reflect(const struct netbuf *nb);
+
+/**
+ * @brief Reflect @p nb back to its sender.
+ *
+ * @p nb->data is at the L4 header, already rewritten by the caller with
+ * the reply (its checksum computed for swapped addresses). Swaps the IP
+ * addresses, fixes length / TTL / checksum, then @c eth_reflect().
+ *
+ * @pre @c ip_can_reflect(nb).
+ * @note Always consumes @p nb.
+ * @return @c 0 on success, @c -1 on error.
+ */
+int ip_reflect(struct netbuf *nb);
+/// @}
+
 /// @name Checksum
 /// @{
 
