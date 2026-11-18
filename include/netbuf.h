@@ -156,6 +156,10 @@ struct netbuf
 
     /// Reference count (freed when it reaches zero).
     int refcount;
+
+    /// RX: hardware queue the packet arrived on
+    /// (a reflected reply leaves on the same queue).
+    uint16_t queue;
 };
 
 _Static_assert(sizeof(struct netbuf) <= NETBUF_META_SIZE,
