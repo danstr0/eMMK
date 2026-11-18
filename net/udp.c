@@ -113,7 +113,7 @@ int udp_bind(uint16_t port, udp_recv_func_t handler)
         {
             bind_table[i].port    = port;
             bind_table[i].handler = handler;
-            bind_table[i].in_use  = true;
+            __atomic_store_n(&bind_table[i].in_use, true, __ATOMIC_RELEASE);
             spin_unlock_irqrestore(&udp_bind_lock, flags);
             kprintf("[UDP] Bound port %u\n", port);
             return 0;
@@ -132,8 +132,8 @@ void udp_unbind(uint16_t port)
     for (int i = 0; i < UDP_MAX_BINDS; ++i)
         if (bind_table[i].in_use && bind_table[i].port == port)
         {
-            bind_table[i].in_use  = false;
-            bind_table[i].handler = NULL;
+            __atomic_store_n(&bind_table[i].in_use, false, __ATOMIC_RELEASE);
+            __atomic_store_n(&bind_table[i].handler, NULL, __ATOMIC_RELAXED);
             spin_unlock_irqrestore(&udp_bind_lock, flags);
             kprintf("[UDP] Unbound port %u\n", port);
             return;
@@ -145,18 +145,11 @@ void udp_unbind(uint16_t port)
 /// Look up the handler for a destination port.
 static udp_recv_func_t udp_find_handler(uint16_t port)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&udp_bind_lock, &flags);
-
     for (int i = 0; i < UDP_MAX_BINDS; ++i)
-        if (bind_table[i].in_use && bind_table[i].port == port)
-        {
-            udp_recv_func_t h = bind_table[i].handler;
-            spin_unlock_irqrestore(&udp_bind_lock, flags);
-            return h;
-        }
+        if (__atomic_load_n(&bind_table[i].in_use, __ATOMIC_ACQUIRE)
+            && bind_table[i].port == port)
+            return __atomic_load_n(&bind_table[i].handler, __ATOMIC_RELAXED);
 
-    spin_unlock_irqrestore(&udp_bind_lock, flags);
     return NULL;
 }
 
@@ -289,6 +282,28 @@ int udp_reply(struct netbuf *nb)
     uint32_t dst_ip   = nb->src_ip;
     uint16_t dst_port = nb->src_port;
     uint16_t src_port = nb->dst_port;
+
+    if (ip_can_reflect(nb))
+    {
+        // Straight back out of the queue it came in on
+        struct udphdr *udp = (struct udphdr *)netbuf_push(nb, UDP_HDR_SIZE);
+        if (!udp)
+        {
+            netbuf_free(nb);
+            return -1;
+        }
+        uint16_t udp_len = (uint16_t)nb->len;
+        udp->src_port = htons(src_port);
+        udp->dst_port = htons(dst_port);
+        udp->len      = htons(udp_len);
+        udp->checksum = 0;
+
+        // Checksum over the swapped addresses: from us, to the sender
+        uint16_t csum = udp_checksum(udp, udp_len, htonl(nb->dst_ip),
+                                     htonl(dst_ip));
+        udp->checksum = (csum == 0) ? 0xFFFF : csum;
+        return ip_reflect(nb);
+    }
 
     nb->dev = NULL;  // ip_output() routes the reply afresh
 
