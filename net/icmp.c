@@ -7,24 +7,40 @@
 #include "ip.h"
 #include "netdev.h"
 #include "ethernet.h"
+#include "net.h"
 #include "endian.h"
 #include "serial.h"
 #include "string.h"
 
-struct icmp_stats icmp_statistics;
+/// Application hook for received echo replies.
+static icmp_echo_reply_hook_t icmp_echo_hook;
 
 // ── Initialization ─────────────────────────────────────────────────────
 
 void icmp_init(void)
 {
-    memset(&icmp_statistics, 0, sizeof(icmp_statistics));
+    icmp_echo_hook = NULL;
     kprintf("[ICMP] Initialized\n");
 }
 
 void icmp_get_stats(struct icmp_stats *stats)
 {
-    if (stats)
-        *stats = icmp_statistics;
+    if (!stats)
+        return;
+
+    // Per-core counters, summed
+    stats->rx_echo_request     = net_stat_total(NET_STAT_ICMP_RX_ECHO_REQ);
+    stats->rx_echo_reply       = net_stat_total(NET_STAT_ICMP_RX_ECHO_REPLY);
+    stats->tx_echo_request     = net_stat_total(NET_STAT_ICMP_TX_ECHO_REQ);
+    stats->tx_echo_reply       = net_stat_total(NET_STAT_ICMP_TX_ECHO_REPLY);
+    stats->tx_dest_unreachable = net_stat_total(NET_STAT_ICMP_TX_UNREACH);
+    stats->rx_errors           = net_stat_total(NET_STAT_ICMP_SHORT);
+    stats->checksum_errors     = net_stat_total(NET_STAT_ICMP_BAD_CSUM);
+}
+
+void icmp_set_echo_reply_hook(icmp_echo_reply_hook_t hook)
+{
+    icmp_echo_hook = hook;
 }
 
 // ── Checksum (wrapper around the IP ones-complement checksum) ──────────
@@ -64,7 +80,7 @@ void icmp_send_echo_reply(struct netbuf *nb)
     if (ip_can_reflect(nb))
     {
         if (ip_reflect(nb) == 0)
-            icmp_statistics.tx_echo_reply++;
+            net_stat_inc(NET_STAT_ICMP_TX_ECHO_REPLY);
         return;
     }
 
@@ -74,7 +90,7 @@ void icmp_send_echo_reply(struct netbuf *nb)
 
     // ip_output always consumes nb
     if (ip_output(nb, reply_dst, IPPROTO_ICMP) == 0)
-        icmp_statistics.tx_echo_reply++;
+        net_stat_inc(NET_STAT_ICMP_TX_ECHO_REPLY);
 }
 
 // ── RX dispatch ────────────────────────────────────────────────────────
@@ -86,7 +102,7 @@ void icmp_input(struct netbuf *nb)
 
     if (nb->len < ICMP_HDR_SIZE)
     {
-        icmp_statistics.rx_errors++;
+        net_stat_inc(NET_STAT_ICMP_SHORT);
         netbuf_free(nb);
         return;
     }
@@ -96,7 +112,7 @@ void icmp_input(struct netbuf *nb)
     // Verify checksum over the entire ICMP message
     if (icmp_checksum(icmp, nb->len) != 0)
     {
-        icmp_statistics.checksum_errors++;
+        net_stat_inc(NET_STAT_ICMP_BAD_CSUM);
         netbuf_free(nb);
         return;
     }
@@ -104,35 +120,30 @@ void icmp_input(struct netbuf *nb)
     switch (icmp->type)
     {
         case ICMP_ECHO_REQUEST:
-            icmp_statistics.rx_echo_request++;
-            kprintf("[ICMP] Echo request from %s, id=%u seq=%u\n",
-                    IP4_FMT(nb->src_ip),
-                    ntohs(icmp->un.echo.id),
-                    ntohs(icmp->un.echo.sequence));
+            net_stat_inc(NET_STAT_ICMP_RX_ECHO_REQ);
             // icmp_send_echo_reply takes ownership of nb
             icmp_send_echo_reply(nb);
             break;
         case ICMP_ECHO_REPLY:
-            icmp_statistics.rx_echo_reply++;
-            kprintf("[ICMP] Echo reply from %s, id=%u seq=%u\n",
-                    IP4_FMT(nb->src_ip),
-                    ntohs(icmp->un.echo.id),
-                    ntohs(icmp->un.echo.sequence));
+        {
+            net_stat_inc(NET_STAT_ICMP_RX_ECHO_REPLY);
+            icmp_echo_reply_hook_t hook = icmp_echo_hook;
+            if (hook)
+                hook(nb->src_ip, ntohs(icmp->un.echo.id),
+                     ntohs(icmp->un.echo.sequence));
             netbuf_free(nb);
             break;
+        }
         case ICMP_DEST_UNREACHABLE:
-            kprintf("[ICMP] Destination unreachable from %s (code %u)\n",
-                    IP4_FMT(nb->src_ip), icmp->code);
+            net_stat_inc(NET_STAT_ICMP_RX_UNREACH);
             netbuf_free(nb);
             break;
         case ICMP_TIME_EXCEEDED:
-            kprintf("[ICMP] Time exceeded from %s (code %u)\n",
-                    IP4_FMT(nb->src_ip), icmp->code);
+            net_stat_inc(NET_STAT_ICMP_RX_TIME_EXC);
             netbuf_free(nb);
             break;
         default:
-            kprintf("[ICMP] Unknown type %u from %s\n",
-                    icmp->type, IP4_FMT(nb->src_ip));
+            net_stat_inc(NET_STAT_ICMP_RX_OTHER);
             netbuf_free(nb);
             break;
     }
@@ -179,10 +190,7 @@ int icmp_send_echo_request(uint32_t dst_ip, uint16_t id, uint16_t seq,
     // Checksum covers the entire ICMP message (header + payload)
     icmp->checksum = icmp_checksum(icmp, ICMP_HDR_SIZE + len);
 
-    icmp_statistics.tx_echo_request++;
-
-    kprintf("[ICMP] Sending echo request to %s, id=%u seq=%u\n",
-            IP4_FMT(dst_ip), id, seq);
+    net_stat_inc(NET_STAT_ICMP_TX_ECHO_REQ);
 
     // ip_output always consumes nb
     return ip_output(nb, dst_ip, IPPROTO_ICMP);
@@ -241,7 +249,7 @@ void icmp_send_dest_unreachable(struct netbuf *nb, uint8_t code)
     // Checksum over the complete ICMP message
     icmp->checksum = icmp_checksum(icmp, ICMP_HDR_SIZE + include_len);
 
-    icmp_statistics.tx_dest_unreachable++;
+    net_stat_inc(NET_STAT_ICMP_TX_UNREACH);
 
     // Send back to the original sender
     uint32_t dst_ip = ntohl(orig_ip->saddr);

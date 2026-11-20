@@ -5,6 +5,7 @@
 
 #include "netdev.h"
 #include "ethernet.h"
+#include "arp.h"
 #include "serial.h"
 #include "string.h"
 #include "heap.h"
@@ -93,6 +94,10 @@ void netdev_unregister(struct netdev *dev)
                 devices[j] = devices[j + 1];
             device_count--;
             devices[device_count] = NULL;
+
+            // No neighbor entry may outlive its interface (its pointer
+            // would match the next device allocated at that address)
+            arp_flush_dev(dev);
 
             kprintf("[NETDEV] Unregistered %s\n", dev->name);
             return;

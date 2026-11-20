@@ -57,10 +57,6 @@ extern const uint8_t ETH_BROADCAST[ETH_ALEN];
 
 /// Zero address: @c 00:00:00:00:00:00 (unset / invalid).
 extern const uint8_t ETH_ZERO[ETH_ALEN];
-
-/// ARP frames dropped because they reached a core other than the TX
-/// owner (with RSS, non-IP frames all go to queue 0, which it polls).
-extern uint64_t eth_arp_misrouted;
 /// @}
 
 /// @name Ethernet header

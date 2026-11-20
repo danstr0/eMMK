@@ -171,23 +171,45 @@ int icmp_send_echo_request(uint32_t dst_ip, uint16_t id, uint16_t seq,
 void icmp_send_dest_unreachable(struct netbuf *nb, uint8_t code);
 /// @}
 
+/// @name Echo replies (application hook)
+/// @{
+
+/**
+ * @brief Called for every received echo reply.
+ * @param src_ip  Replying host (host byte order).
+ * @param id      Echo identifier.
+ * @param seq     Echo sequence number.
+ */
+typedef void (*icmp_echo_reply_hook_t)(uint32_t src_ip, uint16_t id,
+                                       uint16_t seq);
+
+/**
+ * @brief Install (or, with @c NULL, remove) the echo-reply hook.
+ *
+ * The stack itself never prints; an application that sends pings and
+ * wants to see the replies (e.g., the default kernel's gateway ping)
+ * installs a hook. It runs on the core that received the reply, inside
+ * the packet path, so it must be as cheap as that core can afford.
+ */
+void icmp_set_echo_reply_hook(icmp_echo_reply_hook_t hook);
+/// @}
+
 /// @name Statistics
 /// @{
+
+/// ICMP totals.
 struct icmp_stats
 {
-    uint64_t rx_echo_request;
-    uint64_t rx_echo_reply;
-    uint64_t tx_echo_request;
-    uint64_t tx_echo_reply;
-    uint64_t tx_dest_unreachable;
-    uint64_t rx_errors;
-    uint64_t checksum_errors;
+    uint64_t rx_echo_request;      ///< Echo requests received.
+    uint64_t rx_echo_reply;        ///< Echo replies received.
+    uint64_t tx_echo_request;      ///< Echo requests sent.
+    uint64_t tx_echo_reply;        ///< Echo replies sent.
+    uint64_t tx_dest_unreachable;  ///< Destination Unreachable sent.
+    uint64_t rx_errors;            ///< Messages shorter than a header.
+    uint64_t checksum_errors;      ///< Messages with a bad checksum.
 };
 
-/// Global ICMP statistics.
-extern struct icmp_stats icmp_statistics;
-
-/// Copy current ICMP statistics into @p stats.
+/// Sum the ICMP counters of all cores into @p stats.
 void icmp_get_stats(struct icmp_stats *stats);
 /// @}
 

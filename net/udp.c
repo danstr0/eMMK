@@ -18,6 +18,7 @@
 #include "icmp.h"
 #include "netdev.h"
 #include "ethernet.h"
+#include "net.h"
 #include "endian.h"
 #include "serial.h"
 #include "string.h"
@@ -162,7 +163,7 @@ void udp_input(struct netbuf *nb)
 
     if (nb->len < UDP_HDR_SIZE)
     {
-        kprintf("[UDP] Packet too short: %lu bytes\n", (uint64_t)nb->len);
+        net_stat_inc(NET_STAT_UDP_SHORT);
         netbuf_free(nb);
         return;
     }
@@ -176,6 +177,7 @@ void udp_input(struct netbuf *nb)
     // Validate the length field
     if (udp_len < UDP_HDR_SIZE || udp_len > nb->len)
     {
+        net_stat_inc(NET_STAT_UDP_BAD_LEN);
         netbuf_free(nb);
         return;
     }
@@ -194,7 +196,7 @@ void udp_input(struct netbuf *nb)
                                          ip->saddr, ip->daddr);
             if (csum != 0)
             {
-                kprintf("[UDP] Bad checksum, dropping\n");
+                net_stat_inc(NET_STAT_UDP_BAD_CSUM);
                 netbuf_free(nb);
                 return;
             }
@@ -222,10 +224,12 @@ void udp_input(struct netbuf *nb)
     }
 
     // No handler - send ICMP Port Unreachable
+    // TODO: rate-limit
     //
     // Push the UDP header back so the ICMP error message includes
     // the original IP header + first 8 bytes of transport data
     // (the UDP header itself)
+    net_stat_inc(NET_STAT_UDP_NO_PORT);
     netbuf_push(nb, UDP_HDR_SIZE);
     icmp_send_dest_unreachable(nb, ICMP_PORT_UNREACHABLE);
     netbuf_free(nb);

@@ -49,6 +49,7 @@ extern uint32_t test_pci_net(void);
 // v0.0.5 suites
 extern uint32_t test_netbuf(void);
 extern uint32_t test_net(void);
+extern uint32_t test_arp(void);
 
 // v0.1.1 suite
 extern uint32_t test_smp(void);
@@ -148,6 +149,7 @@ NORETURN void test_main(struct multiboot2_info *mb_info)
     // ── v0.0.5 ──────────────────────────────────────────
     failures += test_netbuf();
     failures += test_net();
+    failures += test_arp();
 
     // ── Summary ─────────────────────────────────────────
     kprintf("==========================\n");
