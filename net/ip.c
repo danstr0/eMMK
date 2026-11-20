@@ -9,6 +9,7 @@
 #include "arp.h"
 #include "icmp.h"
 #include "udp.h"
+#include "net.h"
 #include "endian.h"
 #include "serial.h"
 #include "string.h"
@@ -158,7 +159,7 @@ int ip_route(uint32_t dst_ip, struct netdev **dev, uint32_t *next_hop)
         return 0;
     }
 
-    kprintf("[IP] No route to %s\n", IP4_FMT(dst_ip));
+    net_stat_inc(NET_STAT_IP_NO_ROUTE);
     return -1;
 }
 
@@ -171,7 +172,7 @@ void ip_input(struct netbuf *nb)
 
     if (nb->len < IP_HDR_MIN)
     {
-        kprintf("[IP] Packet too short: %lu bytes\n", (uint64_t)nb->len);
+        net_stat_inc(NET_STAT_IP_SHORT);
         netbuf_free(nb);
         return;
     }
@@ -181,6 +182,7 @@ void ip_input(struct netbuf *nb)
     // Validate version
     if (ip->version != IP_VERSION)
     {
+        net_stat_inc(NET_STAT_IP_BAD_VERSION);
         netbuf_free(nb);
         return;
     }
@@ -189,6 +191,7 @@ void ip_input(struct netbuf *nb)
     size_t hdr_len = (size_t)ip->ihl * 4;
     if (hdr_len < IP_HDR_MIN || hdr_len > nb->len)
     {
+        net_stat_inc(NET_STAT_IP_BAD_HDR_LEN);
         netbuf_free(nb);
         return;
     }
@@ -196,7 +199,7 @@ void ip_input(struct netbuf *nb)
     // Verify header checksum
     if (ip_checksum(ip, hdr_len) != 0)
     {
-        kprintf("[IP] Bad checksum, dropping\n");
+        net_stat_inc(NET_STAT_IP_BAD_CSUM);
         netbuf_free(nb);
         return;
     }
@@ -205,6 +208,7 @@ void ip_input(struct netbuf *nb)
     uint16_t tot_len = ntohs(ip->tot_len);
     if (tot_len < hdr_len || tot_len > nb->len)
     {
+        net_stat_inc(NET_STAT_IP_BAD_LEN);
         netbuf_free(nb);
         return;
     }
@@ -225,6 +229,7 @@ void ip_input(struct netbuf *nb)
     // No forwarding - drop packets not addressed to this host
     if (!ip_is_local(dst_ip) && !ip_is_broadcast(dst_ip, nb->dev))
     {
+        net_stat_inc(NET_STAT_IP_NOT_LOCAL);
         netbuf_free(nb);
         return;
     }
@@ -249,6 +254,7 @@ void ip_input(struct netbuf *nb)
         // TCP not yet implemented - drop
         case IPPROTO_TCP:
         default:
+            net_stat_inc(NET_STAT_IP_UNKNOWN_PROTO);
             netbuf_free(nb);
             break;
     }

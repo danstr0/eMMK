@@ -7,6 +7,7 @@
 #include "netdev.h"
 #include "arp.h"
 #include "ip.h"
+#include "net.h"
 #include "serial.h"
 #include "string.h"
 #include "endian.h"
@@ -15,9 +16,6 @@
 
 const uint8_t ETH_BROADCAST[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 const uint8_t ETH_ZERO[ETH_ALEN]      = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-/// ARP frames that reached a core other than the TX owner (dropped).
-uint64_t eth_arp_misrouted;
 
 // ── MAC address formatting ─────────────────────────────────────────────
 
@@ -47,8 +45,7 @@ void eth_input(struct netbuf *nb)
 
     if (nb->len < ETH_HLEN)
     {
-        kprintf("[ETH] Runt frame: %lu bytes (need %u)\n",
-                (uint64_t)nb->len, ETH_HLEN);
+        net_stat_inc(NET_STAT_ETH_RUNT);
         netbuf_free(nb);
         return;
     }
@@ -71,6 +68,7 @@ void eth_input(struct netbuf *nb)
     else
     {
         nb->pkt_type = PKT_OTHERHOST;
+        net_stat_inc(NET_STAT_ETH_OTHERHOST);
         netbuf_free(nb);
         return;
     }
@@ -94,7 +92,7 @@ void eth_input(struct netbuf *nb)
             // anything else is a misrouted frame and is dropped.
             if (!ip_is_tx_owner())
             {
-                __atomic_fetch_add(&eth_arp_misrouted, 1, __ATOMIC_RELAXED);
+                net_stat_inc(NET_STAT_ETH_ARP_MISROUTED);
                 netbuf_free(nb);
                 break;
             }
@@ -104,7 +102,7 @@ void eth_input(struct netbuf *nb)
             ip_input(nb);
             break;
         default:
-            kprintf("[ETH] Unknown ethertype 0x%x; dropping\n", ethertype);
+            net_stat_inc(NET_STAT_ETH_UNKNOWN_TYPE);
             netbuf_free(nb);
             break;
     }
