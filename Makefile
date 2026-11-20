@@ -116,13 +116,14 @@ ASM_SRC  := boot/multiboot2.asm boot/entry64.asm kernel/isr.asm \
 
 KERN_SRC := kernel/serial.c kernel/format.c kernel/string.c kernel/idt.c \
 			kernel/panic.c kernel/irq.c                                  \
-            kernel/pic.c kernel/apic.c kernel/timer.c                    \
+			kernel/pic.c kernel/apic.c kernel/timer.c                    \
 			kernel/tss.c kernel/percpu.c kernel/smp.c kernel/tsc.c       \
 			kernel/log.c kernel/spsc.c kernel/bench.c                    \
 			mm/pmm.c mm/vmm.c mm/heap.c mm/slab.c                        \
 			drivers/pci.c drivers/virtio.c drivers/net/virtio_net.c      \
 			net/netbuf.c net/ethernet.c net/netdev.c                     \
-			net/arp.c net/ip.c net/icmp.c net/udp.c net/dispatch.c
+			net/arp.c net/ip.c net/icmp.c net/udp.c net/dispatch.c       \
+			net/net.c
 
 TEST_SRC := test/test_main.c test/test_types.c test/test_string.c \
 			test/test_pmm.c test/test_vmm.c test/test_heap.c      \
