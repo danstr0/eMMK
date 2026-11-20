@@ -40,6 +40,7 @@
 #include "ip.h"
 #include "icmp.h"
 #include "udp.h"
+#include "net.h"
 #include "string.h"
 
 #ifdef KERNEL_DEMO
@@ -124,6 +125,15 @@ static void net_configure(void)
     }
 }
 
+// ── Default kernel: gateway ping ───────────────────────────────────────
+
+/// Echo-reply hook of the boot ping.
+static void ping_reply_print(uint32_t src_ip, uint16_t id, uint16_t seq)
+{
+    kprintf("[PING] Echo reply from %s, id=%u seq=%u\n",
+            IP4_FMT(src_ip), id, seq);
+}
+
 // ── Demo: UDP echo handler ─────────────────────────────────────────────
 
 #ifdef KERNEL_DEMO
@@ -193,7 +203,7 @@ static void demo_report_buffers(void)
             remote_frees, fails);
     kprintf("[DEMO] cross-core: handoffs=%lu remote_frees=%lu "
             "arp_misrouted=%lu\n", ip_tx_handoff_count(), remote_frees,
-            __atomic_load_n(&eth_arp_misrouted, __ATOMIC_RELAXED));
+            net_stat_total(NET_STAT_ETH_ARP_MISROUTED));
 }
 
 /// Print the reports every ~5 seconds (called by core 0 only).
@@ -221,6 +231,7 @@ static NORETURN void bench_distributor_loop(int core_index)
         if (dispatch_rx() > 0)
             bench_record_busy(core_index, tsc_read() - t0);
 
+        net_housekeeping();
         demo_maybe_report(&next_report);
         __asm__ volatile("pause");
     }
@@ -274,7 +285,10 @@ static NORETURN void rss_core_loop(int core)
             bench_record_busy(core, tsc_read() - t0);
 
         if (core == 0)
+        {
+            net_housekeeping();
             demo_maybe_report(&next_report);
+        }
         __asm__ volatile("pause");
     }
 }
@@ -502,6 +516,7 @@ non_demo:
     // ── Test ping to every NIC's gateway ────────────────
     if (virtio_net_count() > 0)
     {
+        icmp_set_echo_reply_hook(ping_reply_print);
         for (int i = 0; i < virtio_net_count(); ++i)
         {
             struct netdev *dev = virtio_net_get(i)->netdev;
@@ -525,8 +540,10 @@ non_demo:
     for (;;)
     {
         while (netdev_poll_all() > 0)
-            ;
-        netdev_idle_wait();
+            net_housekeeping();
+        net_housekeeping();
+        if (!net_timers_pending())
+            netdev_idle_wait();
     }
 }
 
