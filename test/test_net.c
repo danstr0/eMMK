@@ -14,6 +14,8 @@
 #include "smp.h"
 #include "heap.h"
 #include "format.h"
+#include "net.h"
+#include "timer.h"
 
 // Dummy handler for UDP bind tests
 static void udp_test_handler(struct netbuf *nb) { netbuf_free(nb); }
@@ -85,6 +87,331 @@ static const struct netdev_ops loop_ops =
 
 /// Echo handler, as in the demo.
 static void udp_test_echo(struct netbuf *nb) { udp_reply(nb); }
+
+// Fake NIC that records what the stack transmits
+
+static int     cap_arp_requests;         ///< ARP requests sent.
+static int     cap_arp_replies;          ///< ARP replies sent.
+static int     cap_ip_frames;            ///< IPv4 frames sent.
+static uint8_t cap_last_dest[ETH_ALEN];  ///< Ethernet dest of the last frame.
+
+static uint16_t cap_tx_burst(struct netdev *dev, uint16_t qid,
+                             struct netbuf **pkts, uint16_t n)
+{
+    (void)dev; (void)qid;
+    for (uint16_t i = 0; i < n; ++i)
+    {
+        struct ethhdr *eth = (struct ethhdr *)pkts[i]->data;
+        eth_copy_addr(cap_last_dest, eth->dest);
+        if (ntohs(eth->ethertype) == ETH_P_ARP)
+        {
+            struct arphdr *arp = (struct arphdr *)(eth + 1);
+            if (ntohs(arp->operation) == ARP_OP_REQUEST)
+                cap_arp_requests++;
+            else
+                cap_arp_replies++;
+        }
+        else if (ntohs(eth->ethertype) == ETH_P_IP)
+            cap_ip_frames++;
+        netbuf_free(pkts[i]);
+    }
+    return n;
+}
+
+static const struct netdev_ops cap_ops = { .tx_burst = cap_tx_burst };
+
+/// An ARP packet as received on @p dev (Ethernet header already removed).
+static struct netbuf *make_arp(struct netdev *dev, uint16_t op,
+                               const uint8_t *sender_mac, uint32_t sender_ip,
+                               uint32_t target_ip)
+{
+    struct netbuf *nb = netbuf_alloc(0);
+    netbuf_reserve(nb, NETBUF_HEADROOM);
+    struct arphdr *arp = (struct arphdr *)netbuf_put(nb, ARP_HDR_SIZE);
+    arp->hw_type    = htons(ARP_HW_ETHER);
+    arp->proto_type = htons(ETH_P_IP);
+    arp->hw_len     = ETH_ALEN;
+    arp->proto_len  = 4;
+    arp->operation  = htons(op);
+    eth_copy_addr(arp->sender_mac, sender_mac);
+    arp->sender_ip  = htonl(sender_ip);
+    memset(arp->target_mac, 0, ETH_ALEN);
+    arp->target_ip  = htonl(target_ip);
+    nb->dev = dev;
+    return nb;
+}
+
+/// A raw frame of @p len bytes with @p ethertype, to @p dev's MAC.
+static struct netbuf *make_frame(struct netdev *dev, uint16_t ethertype,
+                                 size_t len)
+{
+    struct netbuf *nb = netbuf_alloc(0);
+    netbuf_reserve(nb, NETBUF_HEADROOM);
+    uint8_t *f = netbuf_put(nb, len);
+    memset(f, 0, len);
+    if (len >= ETH_HLEN)
+    {
+        struct ethhdr *eth = (struct ethhdr *)f;
+        eth_copy_addr(eth->dest, dev->mac);
+        eth->src[0] = 0x02;
+        eth->ethertype = htons(ethertype);
+    }
+    nb->dev = dev;
+    return nb;
+}
+
+/// Suite "arp": ARP retransmission and aging, per-interface entries,
+/// and drop counters.
+uint32_t test_arp(void)
+{
+    TEST_BEGIN("arp");
+
+    static const uint8_t mac_a[ETH_ALEN] = {0x02, 0, 0, 0, 0xAA, 0x01};
+    static const uint8_t mac_b[ETH_ALEN] = {0x02, 0, 0, 0, 0xBB, 0x02};
+    static const uint8_t mac_s[ETH_ALEN] = {0x02, 0, 0, 0, 0x55, 0x03};
+    const uint32_t mask   = IP4_ADDR(255, 255, 255, 0);
+    const uint32_t ip0    = IP4_ADDR(10, 6, 6, 2);   // arp0
+    const uint32_t ip1    = IP4_ADDR(10, 6, 6, 3);   // arp1, same subnet
+    const uint32_t peer   = IP4_ADDR(10, 6, 6, 1);
+    const uint32_t dead   = IP4_ADDR(10, 6, 6, 9);   // never answers
+    const uint32_t fixed  = IP4_ADDR(10, 6, 6, 7);   // static entry
+
+    // ── Counter registry ───────────────────────────────
+    TEST_ASSERT_STREQ(net_stat_name(NET_STAT_ETH_RUNT), "eth_runt",
+                      "counter names come from NET_STAT_LIST");
+    TEST_ASSERT_STREQ(net_stat_name(NET_STAT_COUNT), "?",
+                      "out-of-range counter has no name");
+    TEST_ASSERT_EQ(sizeof(struct net_core_stats) % 64, 0,
+                   "per-core counter blocks are whole cache lines");
+    {
+        uint64_t before = net_stat_total(NET_STAT_UDP_NO_PORT);
+        net_stat_inc(NET_STAT_UDP_NO_PORT);
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_UDP_NO_PORT), before + 1,
+                       "net_stat_inc counts on this core");
+        net_core_stats[smp_core_id()].c[NET_STAT_UDP_NO_PORT]--;
+    }
+
+    struct netdev *d0 = netdev_alloc("arp0");
+    struct netdev *d1 = netdev_alloc("arp1");
+    TEST_ASSERT(d0 && d1, "ARP fake netdevs allocated");
+    if (!d0 || !d1)
+    {
+        kfree(d0);
+        kfree(d1);
+        TEST_END();
+    }
+    d0->mac[0] = 0x02; d0->mac[5] = 0x10;
+    d1->mac[0] = 0x02; d1->mac[5] = 0x11;
+    d0->ops = &cap_ops;
+    d1->ops = &cap_ops;
+    netdev_register(d0);
+    netdev_register(d1);
+    netdev_set_up(d0);
+    netdev_set_up(d1);
+    netdev_set_ip(d0, ip0, mask, 0);
+    netdev_set_ip(d1, ip1, mask, 0);
+
+    // ── Bug 1: a lost reply is retransmitted ───────────
+    // (The old cache sent one request and then waited forever)
+    {
+        cap_arp_requests = cap_ip_frames = 0;
+        uint64_t retx = net_stat_total(NET_STAT_ARP_RETRANSMIT);
+
+        struct netbuf *nb = netbuf_alloc(0);
+        netbuf_reserve(nb, NETBUF_HEADROOM);
+        netbuf_put(nb, 8);
+        nb->dev  = d0;
+        TEST_ASSERT_EQ(arp_queue_packet(d0, peer, nb), 0, "packet queued");
+        TEST_ASSERT_EQ(cap_arp_requests, 1, "first request sent");
+        TEST_ASSERT_EQ(arp_entry_state(d0, peer), ARP_STATE_INCOMPLETE,
+                       "entry incomplete");
+        TEST_ASSERT(arp_timers_pending(), "a timer is armed");
+
+        // The reply is "lost": nothing arrives. Before the deadline,
+        // nothing happens; after it, the request is sent again.
+        uint64_t t = timer_get_ms();
+        arp_timer(t);
+        TEST_ASSERT_EQ(cap_arp_requests, 1,
+                       "no retransmit before the deadline");
+        arp_timer(t + ARP_RETRANS_MS + 1);
+        TEST_ASSERT_EQ(cap_arp_requests, 2, "request retransmitted");
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ARP_RETRANSMIT), retx + 1,
+                       "retransmission counted");
+
+        // This time the reply arrives: the queued packet goes out
+        arp_input(make_arp(d0, ARP_OP_REPLY, mac_a, peer, ip0));
+        TEST_ASSERT_EQ(arp_entry_state(d0, peer), ARP_STATE_REACHABLE,
+                       "reply resolves the entry");
+        TEST_ASSERT_EQ(cap_ip_frames, 1,
+                       "queued packet sent on resolution");
+        TEST_ASSERT_MEMEQ(cap_last_dest, mac_a, ETH_ALEN,
+                          "sent to the resolved MAC");
+        TEST_ASSERT(!arp_timers_pending(), "no timer left armed");
+    }
+
+    // ── A resolution that never succeeds gives up ──────
+    {
+        cap_arp_requests = cap_ip_frames = 0;
+        uint64_t failed = net_stat_total(NET_STAT_ARP_RESOLVE_FAILED);
+        uint64_t qdrop  = net_stat_total(NET_STAT_ARP_QUEUE_DROP);
+
+        struct netbuf *nb = netbuf_alloc(0);
+        netbuf_reserve(nb, NETBUF_HEADROOM);
+        netbuf_put(nb, 8);
+        nb->dev = d0;
+        arp_queue_packet(d0, dead, nb);
+
+        uint64_t t = timer_get_ms();
+        for (int i = 1; i <= ARP_MAX_PROBES; ++i)
+            arp_timer(t + (uint64_t)i * (ARP_RETRANS_MS + 1));
+
+        TEST_ASSERT_EQ(cap_arp_requests, ARP_MAX_PROBES,
+                       "ARP_MAX_PROBES requests, then no more");
+        TEST_ASSERT_EQ(arp_entry_state(d0, dead), ARP_STATE_FREE,
+                       "unanswered entry freed");
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ARP_RESOLVE_FAILED),
+                       failed + 1,
+                       "failure counted");
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ARP_QUEUE_DROP),
+                       qdrop + 1,
+                       "its queued packet dropped and counted");
+        TEST_ASSERT_EQ(cap_ip_frames, 0,
+                       "nothing sent to an unresolved MAC");
+    }
+
+    // ── Bug 3: entries are per interface ───────────────
+    // The same address answers on arp1 from another MAC. The old cache,
+    // keyed by IP only, overwrote arp0's entry with it.
+    {
+        cap_arp_replies = 0;
+        arp_input(make_arp(d1, ARP_OP_REQUEST, mac_b, peer, ip1));
+        TEST_ASSERT_EQ(cap_arp_replies, 1,
+                       "request for our address answered");
+
+        uint8_t mac[ETH_ALEN];
+        TEST_ASSERT(arp_lookup(d0, peer, mac) == 0
+                    && eth_addr_equal(mac, mac_a),
+                    "ARP on arp1 leaves arp0's entry alone");
+        TEST_ASSERT(arp_lookup(d1, peer, mac) == 0
+                    && eth_addr_equal(mac, mac_b),
+                    "arp1 learns its own entry");
+    }
+
+    // ── Static entries are never overwritten ───────────
+    {
+        uint8_t mac[ETH_ALEN];
+        arp_add_static(fixed, mac_s, d0);
+        arp_input(make_arp(d0, ARP_OP_REPLY, mac_b, fixed, ip0));
+        TEST_ASSERT(arp_lookup(d0, fixed, mac) == 0
+                    && eth_addr_equal(mac, mac_s),
+                    "received ARP does not change a static entry");
+    }
+
+    // ── Validation: what is never learned ──────────────
+    {
+        static const uint8_t bcast[ETH_ALEN] =
+            {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        const uint32_t off_subnet = IP4_ADDR(10, 1, 1, 1);
+        uint64_t ignored  = net_stat_total(NET_STAT_ARP_IGNORED);
+        uint64_t conflict = net_stat_total(NET_STAT_ARP_CONFLICT);
+        uint64_t bad      = net_stat_total(NET_STAT_ARP_MALFORMED);
+        cap_arp_replies = 0;
+
+        arp_input(make_arp(d0, ARP_OP_REQUEST, mac_b, off_subnet, ip0));
+        TEST_ASSERT_EQ(arp_entry_state(d0, off_subnet), ARP_STATE_FREE,
+                       "sender off the interface's subnet not learned");
+        arp_input(make_arp(d0, ARP_OP_REQUEST, bcast, IP4_ADDR(10, 6, 6, 50),
+                           ip0));
+        TEST_ASSERT_EQ(arp_entry_state(d0, IP4_ADDR(10, 6, 6, 50)),
+                       ARP_STATE_FREE, "broadcast sender MAC not learned");
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ARP_IGNORED), ignored + 2,
+                       "both counted as ignored");
+        TEST_ASSERT_EQ(cap_arp_replies, 0, "and neither answered");
+
+        arp_input(make_arp(d0, ARP_OP_REPLY, mac_b, ip0, ip0));
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ARP_CONFLICT), conflict + 1,
+                       "a station claiming our address is counted");
+
+        struct netbuf *nb = make_arp(d0, 7, mac_b, peer, ip0);
+        arp_input(nb);
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ARP_MALFORMED), bad + 1,
+                       "unknown ARP operation counted as malformed");
+    }
+
+    // ── Bug 2: aging — stale, refreshed, expired ───────
+    {
+        // arp1 goes away first: its entries go with it (arp_flush_dev)
+        netdev_unregister(d1);
+        TEST_ASSERT_EQ(arp_entry_state(d1, peer), ARP_STATE_FREE,
+                       "unregistering an interface drops its entries");
+
+        uint8_t mac[ETH_ALEN];
+        uint64_t expired = net_stat_total(NET_STAT_ARP_EXPIRED);
+        uint64_t t = timer_get_ms() + ARP_REACHABLE_MS + 1;
+        cap_arp_requests = 0;
+
+        arp_timer(t);
+        TEST_ASSERT_EQ(arp_entry_state(d0, peer), ARP_STATE_STALE,
+                       "entry stale after ARP_REACHABLE_MS");
+        TEST_ASSERT(arp_lookup(d0, peer, mac) == 0
+                    && eth_addr_equal(mac, mac_a),
+                    "stale entry still resolves");
+        TEST_ASSERT_EQ(cap_arp_requests, 1, "refresh request sent");
+        TEST_ASSERT_MEMEQ(cap_last_dest, mac_a, ETH_ALEN,
+                          "refresh asks the known MAC (unicast)");
+
+        // Answered: reachable again
+        arp_input(make_arp(d0, ARP_OP_REPLY, mac_a, peer, ip0));
+        TEST_ASSERT_EQ(arp_entry_state(d0, peer), ARP_STATE_REACHABLE,
+                       "refresh reply makes the entry reachable");
+
+        // Next time, unanswered: unicast, unicast, broadcast, expired
+        t = timer_get_ms() + ARP_REACHABLE_MS + 1;
+        cap_arp_requests = 0;
+        arp_timer(t);
+        arp_timer(t + ARP_RETRANS_MS);
+        TEST_ASSERT_MEMEQ(cap_last_dest, mac_a, ETH_ALEN,
+                          "second try unicast");
+        arp_timer(t + 2 * ARP_RETRANS_MS);
+        TEST_ASSERT(eth_is_broadcast(cap_last_dest),
+                    "last try broadcast");
+        TEST_ASSERT_EQ(cap_arp_requests, ARP_MAX_PROBES,
+                       "ARP_MAX_PROBES tries");
+        arp_timer(t + 3 * ARP_RETRANS_MS);
+        TEST_ASSERT_EQ(arp_entry_state(d0, peer), ARP_STATE_FREE,
+                       "unanswered refresh expires the entry");
+        TEST_ASSERT(net_stat_total(NET_STAT_ARP_EXPIRED) > expired,
+                       "expiry counted");
+        TEST_ASSERT_EQ(arp_entry_state(d0, fixed), ARP_STATE_STATIC,
+                       "static entry untouched by aging");
+    }
+
+    // ── Bug 4: malformed traffic is counted, not printed ─
+    {
+        uint64_t runt  = net_stat_total(NET_STAT_ETH_RUNT);
+        uint64_t type  = net_stat_total(NET_STAT_ETH_UNKNOWN_TYPE);
+        uint64_t short_ip = net_stat_total(NET_STAT_IP_SHORT);
+
+        eth_input(make_frame(d0, 0, 10));
+        eth_input(make_frame(d0, 0x88B5, 60));        // local experimental
+        eth_input(make_frame(d0, ETH_P_IP, ETH_HLEN + 4));
+
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ETH_RUNT), runt + 1,
+                       "runt frame counted");
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_ETH_UNKNOWN_TYPE), type + 1,
+                       "unknown ethertype counted");
+        TEST_ASSERT_EQ(net_stat_total(NET_STAT_IP_SHORT), short_ip + 1,
+                       "short IP packet counted");
+    }
+
+    netdev_unregister(d0);
+    TEST_ASSERT_EQ(arp_entry_state(d0, fixed), ARP_STATE_FREE,
+                   "static entries go with their interface too");
+    kfree(d0);
+    kfree(d1);
+
+    TEST_END();
+}
 
 /// Build an Ethernet + IP + UDP frame into a fresh @p pool buffer, as if
 /// the device had written it there.
